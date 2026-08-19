@@ -465,6 +465,7 @@ knowing before trusting a `--save-depth` map as a measurement.
 | `--save-depth` | off | Also write a 16-bit `_depth.png`, near white and far black, scaled across its own range so it can be looked at. The two distances it scaled by go in the PNG's metadata as `stereocraft:near_m` and `stereocraft:far_m`, so `metres = far - (value / 65535) * (far - near)` gets them back. Read [where the metres come from](#where-the-metres-come-from) before trusting them. |
 | `--projection` | `flat` | `flat` writes a rectilinear pair, shown on a virtual screen. `vr180` wraps the same geometry onto a hemisphere at its true angular scale — see [VR180](#vr180). |
 | `--vr180-size` | `auto` | Stored width per eye for `--projection vr180`. `auto` keeps as much of the source's own detail as fits, capped at 4096 (2048 for a clip). |
+| `--vr180-surround` | off | Fill the part of the sphere the picture never reached with a dim, blurred spread of it, rather than leaving it black. A fixed function of each frame, so a clip cannot crawl with it. |
 | `--device` | `auto` | `cuda`, `mps` or `cpu`. |
 | `--oversize` | `ask` | A photo too big for memory: `ask` what to do, `skip` it, or `resize` it to the largest size that fits. |
 
@@ -587,6 +588,25 @@ catches up.
 | 16mm ultrawide | 96.7° × 73.7° | 30% | 70% |
 | 13mm ultrawide | 108.3° × 92.2° | 40% | 60% |
 
+**The dark can be lit instead.** `--vr180-surround` fills it with a dim,
+blurred spread of the picture — what a social video site puts behind a clip that
+does not fill the frame. It reads as the light coming off the picture rather
+than as a second, blurrier photograph, and it makes an enormous difference to
+how a 15%-covered frame feels to sit inside.
+
+It earns its place for the reason an outpainting model does not: it is a **fixed
+function of the frame**, so it moves exactly as the picture moves and cannot
+crawl or boil between frames. Nothing is invented that was not already on
+screen. Two things differ from the rectangular case, both because this is a
+sphere — the wash is spread outward from the edge rather than scaled up from the
+middle, so what sits beside you is the colour the camera saw *in that
+direction*; and both eyes get the same wash, because a periphery with a parallax
+of its own would fight the real picture over where your eyes should converge.
+
+It costs nothing measurable in time, and about 0.03 MB in size — a smooth blur
+is almost free to compress. The reported coverage does not move, because it
+counts what the camera saw and not what was painted in.
+
 **Resolution.** The square is sized to keep the photograph's own detail where
 it can, which for a 65-degree lens means a side nearly three times the source
 width, capped at 4096 for a photo and 2048 for a clip. Past the cap the picture
@@ -634,7 +654,9 @@ That is the metadata working. Use `--projection flat` for 2D spot checks.
 **The one thing it still does not do** is invent the periphery, which is the
 honest state of the art: a 512-tall diffusion model filling 85% of the frame,
 hallucinated depth behind hallucinated colour, on an app whose whole argument is
-that its geometry is measured rather than guessed.
+that its geometry is measured rather than guessed — and on a clip, boiling
+differently in every frame. `--vr180-surround` is the part of that idea worth
+having: it lights the dark without pretending to know what was in it.
 
 Video takes the flag too. The frame has to be settled before the first one is
 decoded — every frame must come out the size of the first — and no clip carries

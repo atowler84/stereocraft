@@ -287,6 +287,92 @@ class TestRender:
         assert not torch.allclose(left, right, atol=1e-3)
 
 
+class TestSurround:
+    """The blurred wash, which is optional and is the one thing here that is not
+    measured -- so what it must not do matters more than what it does."""
+
+    def spot(self, side=128):
+        return vr180.Patch(180.0, 180.0, side, side)
+
+    def scene(self, h=64, w=64):
+        """Something with structure, so a blur is distinguishable from a smear."""
+        torch.manual_seed(0)
+        base = torch.rand(3, 8, 8)
+        return torch.nn.functional.interpolate(base[None], size=(h, w), mode="nearest")[0]
+
+    def rendered(self, wash, spot=None, focal=64.0):
+        spot = spot or self.spot()
+        rgb = self.scene()
+        return vr180.render(rgb, torch.full((64, 64), 1 / 3), focal, 65.0, 3.0, spot, wash=wash)
+
+    def test_off_it_is_still_black(self):
+        left, _, mask = self.rendered(wash=False)
+        assert float(left[:, ~mask].max()) == pytest.approx(0.0, abs=1e-6)
+
+    def test_on_the_void_is_filled(self):
+        left, _, mask = self.rendered(wash=True)
+        assert float(left[:, ~mask].mean()) > 0.02, "the dark is meant to be lit now"
+
+    def test_both_eyes_get_exactly_the_same_wash(self):
+        """The one that matters.  A periphery with a parallax of its own fights
+        the real picture over where the viewer's eyes should converge, and there
+        is no true disparity to give it -- nothing was ever there."""
+        left, right, mask = self.rendered(wash=True)
+        assert torch.equal(left[:, ~mask], right[:, ~mask])
+
+    def test_the_picture_itself_is_untouched(self):
+        """The wash goes behind, not over.  Deep inside the picture the two
+        renders have to agree to the bit."""
+        plain, _, mask = self.rendered(wash=False)
+        washed, _, _ = self.rendered(wash=True)
+        deep = stereo._box(mask.float()[None, None], 6)[0, 0] > 0.999
+        assert bool(deep.any()), "there is a deep interior to check"
+        assert torch.allclose(plain[:, deep], washed[:, deep], atol=1e-6)
+
+    def test_it_is_dimmer_than_the_picture(self):
+        """A bright periphery is tiring to sit inside and competes with the
+        thing you are meant to be looking at."""
+        left, _, mask = self.rendered(wash=True)
+        assert float(left[:, ~mask].mean()) < float(left[:, mask].mean())
+
+    def test_it_is_smoother_than_the_picture(self):
+        """Otherwise it is a second, blurrier photograph rather than the light
+        coming off the first."""
+        left, _, mask = self.rendered(wash=True)
+        rough = (left[:, :, 1:] - left[:, :, :-1]).abs()
+        void = (~mask)[:, 1:] & (~mask)[:, :-1]
+        inside = mask[:, 1:] & mask[:, :-1]
+        assert float(rough[:, void].mean()) < float(rough[:, inside].mean()) / 4
+
+    def test_it_follows_the_edge_it_is_beside(self):
+        """Spread outward rather than scaled up from the middle, so what sits
+        beside the viewer is the colour the camera saw in that direction."""
+        spot = self.spot(160)
+        rgb = torch.zeros(3, 64, 64)
+        rgb[0] = 1.0  # a red left half and a blue right half
+        rgb[:, :, 32:] = torch.tensor([0.0, 0.0, 1.0])[:, None, None]
+        eq, mask = vr180.project(rgb, 64.0, spot)
+        fill = vr180.surround(eq, mask, spot)
+        row = spot.height // 2
+        left_of, right_of = fill[:, row, 4], fill[:, row, -5]
+        assert float(left_of[0]) > float(left_of[2]), "red side stays red"
+        assert float(right_of[2]) > float(right_of[0]), "blue side stays blue"
+
+    def test_a_small_move_makes_a_small_change(self):
+        """The anti-boil property, and the whole reason this is a blur and not a
+        diffusion model: the wash is a fixed function of the frame, so a frame
+        that barely moves produces a surround that barely moves."""
+        spot = self.spot()
+        rgb = self.scene()
+        moved = torch.roll(rgb, shifts=1, dims=2)
+        washes = []
+        for source in (rgb, moved):
+            eq, mask = vr180.project(source, 64.0, spot)
+            washes.append(vr180.surround(eq, mask, spot))
+        drift = float((washes[0] - washes[1]).abs().mean())
+        assert drift < 0.02, f"a one-pixel move must not restate the surround ({drift:.3f})"
+
+
 class TestAutoTarget:
     """The separation `auto` asks for has to be an angle, and stay one however
     much of the sphere the file happens to store."""

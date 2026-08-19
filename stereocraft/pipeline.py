@@ -69,6 +69,13 @@ class Settings:
     # stored, so this buys picture rather than dark -- see `vr180`.
     vr180_size: object = "auto"
     vr180_cap: int = vr180.MAX_SIZE
+    # Fill the part of the sphere the picture never reached with a dim, blurred
+    # spread of the picture, instead of leaving it black -- what a social video
+    # site puts behind a clip that does not fill the frame.  Off by default
+    # because it is the one thing here that is not measured; on, it is still a
+    # fixed function of the frame rather than anything invented, so a clip
+    # cannot crawl with it.  See `vr180.surround`.
+    vr180_surround: bool = False
     # Called when a photo will not fit, with the `TooBig` describing it, and
     # expected to return "resize" or "skip".  Left unset nothing is ever
     # silently downscaled: the photo is skipped and the caller told why.
@@ -469,7 +476,8 @@ class Converter:
         # distance in millimetres either way, but what counts as enough of one is
         # set by how far the picture is stretched to get onto the sphere.
         eyes, focus = self.geometry(inverse, spot.width, spot.per_radian, vr180.auto_target(spot))
-        left, right, mask = vr180.render(rgb, inverse, focal_full, eyes, focus, spot)
+        left, right, mask = vr180.render(rgb, inverse, focal_full, eyes, focus, spot,
+                                         wash=cfg.vr180_surround)
         self.chose = (eyes, focus)
         self.covered = vr180.coverage(mask, spot)
         self.spot = spot

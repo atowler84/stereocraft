@@ -49,6 +49,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 from . import stereo
 
@@ -66,6 +67,12 @@ LIMIT_DEG = 1.2
 # How wide the fade at the edge of the real picture is.  In degrees rather than
 # pixels, because it is a fact about the sphere and not about the file.
 FALLOFF_DEG = 4.0
+# How coarse the optional surround is, and how much dimmer than the picture.
+# Coarse enough to read as light rather than as a second blurry photograph, and
+# dim because a bright periphery is tiring to sit inside and competes with the
+# thing you are meant to be looking at.
+SURROUND_BLUR_DEG = 12.0
+SURROUND_DIM = 0.45
 # Ceilings on the stored width per eye.  A still can afford a big one; a clip has
 # to come back out of a hardware decoder, and 2048 per eye is 4096 across.
 MAX_SIZE = 4096
@@ -217,8 +224,6 @@ def project(source, focal_px, spot):
     Banded over output rows: a large projection built in one piece is several
     gigabytes, and nothing here needs it to be.
     """
-    import torch.nn.functional as F
-
     src_h, src_w = source.shape[-2:]
     out = torch.zeros(source.shape[0], spot.height, spot.width,
                       device=source.device, dtype=source.dtype)
@@ -263,6 +268,49 @@ def _falloff(mask, spot):
     return mask.float() * (soft * soft * (3.0 - 2.0 * soft))  # smoothstep
 
 
+def surround(equirect, mask, spot, dim=SURROUND_DIM, blur_deg=SURROUND_BLUR_DEG):
+    """A dim, blurred wash for the part of the sphere the photograph never
+    reached -- what every social video site puts behind a clip that does not
+    fill the frame.
+
+    It earns its place here for the reason a diffusion fill does not: it is a
+    fixed function of the frame, so it moves exactly as the picture moves and
+    cannot crawl or boil from one frame to the next.  Nothing is invented that
+    was not already on screen.
+
+    Two things differ from the rectangular case, both because this is a sphere.
+    The wash is spread outward from the edge rather than scaled up from the
+    middle, so what sits beside the viewer is the colour of whatever the camera
+    saw in that direction -- a centre copy would put the subject's face in their
+    peripheral vision.  And `render` uses one wash for both eyes, because a
+    periphery carrying parallax of its own would fight the real picture over
+    where the eyes should converge.
+    """
+    colour, weight = (equirect * mask)[None], mask.float()[None, None]
+
+    # Push-pull: average down until every level has something in it, then come
+    # back up, blending the finer detail in wherever there was any.
+    stack = []
+    while min(colour.shape[-2:]) > 1:
+        stack.append((colour, weight))
+        colour = F.avg_pool2d(colour, 2, ceil_mode=True)
+        weight = F.avg_pool2d(weight, 2, ceil_mode=True)
+
+    # Stopping short of the finest levels is what blurs it.  Those levels carry
+    # the picture's own detail, and putting it back would make the surround a
+    # second, blurrier photograph rather than the light coming off the first.
+    span = max(2.0, blur_deg * spot.width / spot.span_az)
+    coarse = max(1, min(len(stack), int(round(math.log2(span)))))
+
+    out = colour / weight.clamp_min(1e-6)
+    for colour, weight in reversed(stack[coarse:]):
+        out = F.interpolate(out, size=colour.shape[-2:], mode="bilinear", align_corners=False)
+        seen = weight.clamp(0, 1)
+        out = seen * (colour / weight.clamp_min(1e-6)) + (1 - seen) * out
+    out = F.interpolate(out, size=tuple(mask.shape), mode="bilinear", align_corners=False)
+    return (out[0] * dim).clamp_(0, 1)
+
+
 def half_disparity(inverse, spot, eyes_mm, focus_m, limit_deg=LIMIT_DEG, elevation=None):
     """Half the omnidirectional-stereo separation, in pixels, for every pixel.
 
@@ -285,12 +333,16 @@ def half_disparity(inverse, spot, eyes_mm, focus_m, limit_deg=LIMIT_DEG, elevati
     return half * torch.cos(elevation.to(half.dtype))[:, None]
 
 
-def render(rgb, inverse, focal_px, eyes_mm, focus_m, spot, limit_deg=LIMIT_DEG):
+def render(rgb, inverse, focal_px, eyes_mm, focus_m, spot, limit_deg=LIMIT_DEG,
+           wash=False):
     """One flat frame and its depth in; a VR180 eye pair and its coverage out.
 
     `rgb` is `[3, H, W]` in [0, 1] and `inverse` the matching `[H, W]` inverse
     depth in 1/metres -- both as the flat path has them, because both are warped
     from there rather than estimated here.
+
+    `wash` fills the empty part of the sphere with `surround` instead of leaving
+    it black.
     """
     equirect, mask = project(rgb, focal_px, spot)
     depth, _ = project(inverse[None], focal_px, spot)
@@ -306,4 +358,9 @@ def render(rgb, inverse, focal_px, eyes_mm, focus_m, spot, limit_deg=LIMIT_DEG):
     left, right = stereo.make_pair(equirect, half, margin=0)
 
     fade = _falloff(mask, spot)
-    return left * fade, right * fade, mask
+    if not wash:
+        return left * fade, right * fade, mask
+    # One wash, both eyes, from the picture before it was split -- see
+    # `surround` for why it must not have a parallax of its own.
+    fill = surround(equirect, mask, spot)
+    return torch.lerp(fill, left, fade), torch.lerp(fill, right, fade), mask

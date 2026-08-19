@@ -121,6 +121,11 @@ def build_parser():
                         help="stored width per eye for --projection vr180, each eye being a "
                              "square 180 degrees across. (default: as much of the source's own "
                              "detail as fits, capped at 4096 for a photo and 2048 for a clip)")
+    parser.add_argument("--vr180-surround", action="store_true",
+                        help="fill the part of the sphere the picture never reached with a dim, "
+                             "blurred spread of the picture rather than leaving it black -- what "
+                             "a social video site puts behind a clip that does not fill the "
+                             "frame. A fixed function of each frame, so a clip cannot crawl")
     parser.add_argument("--cross", action="store_true", help="write right|left for cross-eyed viewing")
     parser.add_argument("--max-size", type=int, default=0, help="cap the output width, 0 for native")
     parser.add_argument("--format", choices=("auto", "jpg", "png"), default="auto", dest="fmt")
@@ -197,6 +202,7 @@ def settings_for(args, video):
         cross_eyed=args.cross,
         device=args.device,
         projection=args.projection,
+        vr180_surround=args.vr180_surround,
         on_oversize=oversize_handler(args.oversize),
     )
     if video:

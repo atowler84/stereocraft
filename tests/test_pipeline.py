@@ -123,6 +123,29 @@ class TestVr180:
         assert b"ns.google.com/photos" not in Path(info["output"]).read_bytes()
         assert info["coverage"] is None
 
+    def test_the_surround_lights_the_dark_without_claiming_it_is_real(
+            self, converter, photo, tmp_path):
+        """It fills the frame and changes nothing about the measurement: the
+        coverage figure counts what the camera saw, not what was painted in."""
+        plain = self.convert(converter, photo, tmp_path / "a.jpg", vr180_size=192)
+        washed = self.convert(converter, photo, tmp_path / "b.jpg", vr180_size=192,
+                              vr180_surround=True)
+        lit = lambda p: (np.asarray(Image.open(p)).max(axis=2) > 8).mean()
+        assert lit(plain["output"]) < 0.35
+        assert lit(washed["output"]) > 0.9
+        assert washed["coverage"] == pytest.approx(plain["coverage"], rel=1e-6)
+
+    def test_the_surround_is_the_same_in_both_eyes(self, converter, photo, tmp_path):
+        """A periphery with a parallax of its own would fight the picture over
+        where the viewer's eyes converge, and there is no true disparity to give
+        it -- nothing was ever there to have one."""
+        info = self.convert(converter, photo, tmp_path / "vr.jpg", vr180_size=192,
+                            vr180_surround=True, fmt="png")
+        out = np.asarray(Image.open(info["output"])).astype(int)
+        left, right = out[:, :192], out[:, 192:]
+        corner = (slice(0, 24), slice(0, 24))  # a pole, which no lens ever reaches
+        assert np.array_equal(left[corner], right[corner])
+
     def test_reports_how_much_of_the_sphere_is_real(self, converter, photo, tmp_path):
         info = self.convert(converter, photo, tmp_path / "vr.jpg", vr180_size=192)
         assert 0.0 < info["coverage"] < 0.5, "a rectilinear photo cannot fill a hemisphere"
