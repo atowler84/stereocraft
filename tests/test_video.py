@@ -9,7 +9,7 @@ import subprocess
 import pytest
 import torch
 
-from stereocraft import video
+from stereocraft import video, vr180
 from stereocraft.pipeline import Settings, VideoSettings
 
 
@@ -89,27 +89,46 @@ class TestVr180Geometry:
         put every remaining pixel at the wrong bearing."""
         assert video.geometry(self.clip(), VideoSettings(projection="vr180")).margin == 0
 
-    def test_the_size_follows_the_assumed_lens(self):
-        """No clip carries intrinsics and the metric model reports none, so the
-        only lens available before the first frame is the assumed one -- and it
-        is what decides how many pixels the hemisphere is worth."""
-        g = video.geometry(self.clip(640, 480), VideoSettings(projection="vr180"))
-        assert g.eye == pytest.approx(640 * 180 / 65.47, abs=2)
-
-    def test_a_big_clip_stops_at_the_cap_rather_than_the_lens(self):
-        """1280 across 65 degrees wants 3519 across 180, which is past what a
-        hardware decoder will take twice over."""
-        g = video.geometry(self.clip(1280, 720), VideoSettings(projection="vr180"))
-        assert g.eye == VideoSettings.vr180_cap
+    def test_the_size_is_the_ceiling_not_the_source(self):
+        """A headset shows 25 pixels a degree whatever it is handed, so a small
+        clip gets the same frame a large one does and differs only in how much
+        of it it can fill -- which is what the upscaler is for."""
+        small = video.geometry(self.clip(640, 480), VideoSettings(projection="vr180"))
+        large = video.geometry(self.clip(3840, 2160), VideoSettings(projection="vr180"))
+        assert small.eye == large.eye == vr180.video_cap(30.0)
 
     def test_an_explicit_size_is_taken(self):
         g = video.geometry(self.clip(), VideoSettings(projection="vr180", vr180_size=1024))
         assert g.eye == 1024
 
-    def test_a_large_one_stops_at_the_cap(self):
-        g = video.geometry(video.Clip(3840, 2160, 30.0, 30, 1.0),
+    @pytest.mark.parametrize("fps,side", [(24.0, 4096), (30.0, 4096), (60.0, 4096),
+                                          (72.0, 3344), (90.0, 3344), (120.0, 2896)])
+    def test_the_ceiling_follows_the_frame_rate(self, fps, side):
+        """A hardware decoder is limited by pixels per second, not by pixels, so
+        a fast clip cannot have what a slow one can."""
+        g = video.geometry(video.Clip(3840, 2160, fps, 100, 3.3),
                            VideoSettings(projection="vr180"))
-        assert g.eye == VideoSettings.vr180_cap
+        assert g.eye == side
+
+    @pytest.mark.parametrize("fps,limit", [(60.0, 8192 * 4096), (90.0, 6688 * 3344),
+                                           (120.0, 5792 * 2896)])
+    def test_the_frame_never_passes_what_the_headset_decodes(self, fps, limit):
+        """The whole point of the ceiling.  A frame past this is not a slower
+        conversion, it is one the headset refuses to play."""
+        g = video.geometry(video.Clip(7680, 4320, fps, 100, 3.3),
+                           VideoSettings(projection="vr180"))
+        assert g.width * g.height <= limit
+
+    def test_a_number_is_taken_as_given(self):
+        """Someone who knows their player says so and is believed."""
+        g = video.geometry(self.clip(), VideoSettings(projection="vr180", vr180_cap=1024))
+        assert g.eye == 1024
+
+    def test_a_1080p_clip_now_reaches_the_headset_s_own_resolution(self):
+        """What the ceiling was raised for: 2048 an eye was 11.4 pixels per
+        degree against a Quest 3's 25, and 1080p had the pixels all along."""
+        g = video.geometry(self.clip(1920, 1080), VideoSettings(projection="vr180"))
+        assert g.eye / 180 == pytest.approx(22.8, abs=0.1)
 
     def test_each_eye_is_square(self):
         """Skybox assumes every eye is a full 180 by 180, which is what the
@@ -122,6 +141,31 @@ class TestVr180Geometry:
     def test_both_dimensions_come_out_even(self, w, h):
         g = video.geometry(video.Clip(w, h, 30.0, 10, 1.0), VideoSettings(projection="vr180"))
         assert g.width % 2 == 0 and g.height % 2 == 0
+
+
+class TestCodecChoice:
+    """Which codec a frame gets, which is decided by its width and not by the
+    projection -- the projection was the first rule and missed a full-width flat
+    pair off a 4K source, 7448 across and past what a headset decodes on h264."""
+
+    @pytest.mark.parametrize("width,codec", [
+        (1920, "h264"),   # an ordinary flat pair
+        (3840, "h264"),   # 4K flat, still fine
+        (3724, "h264"),   # full width off 1080p
+        (7448, "hevc"),   # full width off 4K
+        (8192, "hevc"),   # every vr180 frame
+    ])
+    def test_it_switches_where_h264_would_not_play(self, width, codec):
+        assert video.codec_for(width) == codec
+
+    def test_a_name_is_taken_at_face_value(self):
+        assert video.codec_for(8192, "h264") == "h264"
+        assert video.codec_for(640, "hevc") == "hevc"
+
+    def test_the_ceiling_is_the_headset_s_and_not_the_level_s(self):
+        """h264 level 6.x reaches 8192; a Quest decodes 4K of it.  The lower
+        number is the one that matters."""
+        assert video.H264_CEILING == 4096
 
 
 class TestEncoders:
@@ -145,6 +189,12 @@ class TestEncoders:
             video.pick_encoder("h264")
 
 
+class _Ran:
+    """What a stood-on `subprocess.run` gives back: a command that worked."""
+
+    returncode = 0
+
+
 class TestNoConsole:
     """Every ffmpeg has to be launched with whatever it takes to keep Windows
     from giving it a console window of its own: the window has none, so each
@@ -163,15 +213,21 @@ class TestNoConsole:
         video.probe(clip)
         assert seen.items() >= video.NO_CONSOLE.items()
 
-    def test_and_so_do_the_two_that_do_the_work(self, monkeypatch, clip, tmp_path):
+    def test_and_so_do_the_three_that_do_the_work(self, monkeypatch, clip, tmp_path):
         seen = []
         info = video.probe(clip)  # before Popen is stood on, since it needs it
         settings = video.VideoSettings()
         monkeypatch.setattr(video.subprocess, "Popen", lambda args, **kwargs: seen.append(kwargs))
+        monkeypatch.setattr(video.subprocess, "run",
+                            lambda args, **kwargs: seen.append(kwargs) or _Ran())
         video._decoder(clip, info, None, None)
-        video._encoder(tmp_path / "out.mp4", clip, info, video.geometry(info, settings),
+        video._encoder(tmp_path / "out.mp4", info, video.geometry(info, settings),
                        settings, None)
-        assert len(seen) == 2
+        # The remux is the third, and the one most easily forgotten: it runs
+        # after the encode rather than beside it.
+        video._remux(tmp_path / "picture.mp4", clip, tmp_path / "out.mp4", info,
+                     settings, None)
+        assert len(seen) == 3
         assert all(kwargs.items() >= video.NO_CONSOLE.items() for kwargs in seen)
 
 
@@ -213,10 +269,10 @@ class TestTemporalDepth:
 
 class TestOutputPath:
     def test_names_the_output_after_the_input(self, tmp_path):
-        assert video.output_path(tmp_path / "a.mov").name == "a_sbs.mp4"
+        assert video.output_path(tmp_path / "a.mov").name == "a_full_sbs.mp4"
 
     def test_a_folder_gets_the_generated_name(self, tmp_path):
-        assert video.output_path(tmp_path / "a.mov", tmp_path).name == "a_sbs.mp4"
+        assert video.output_path(tmp_path / "a.mov", tmp_path).name == "a_full_sbs.mp4"
 
     def test_an_explicit_name_is_kept(self, tmp_path):
         assert video.output_path(tmp_path / "a.mov", tmp_path / "b.mkv").name == "b.mkv"
@@ -226,3 +282,82 @@ class TestClock:
     @pytest.mark.parametrize("seconds,expected", [(5, "5s"), (65, "1m05s"), (3600, "1h00m")])
     def test_formats_a_wait(self, seconds, expected):
         assert video.clock(seconds) == expected
+
+
+class TestTheSoundtrackIsAddedAfterwards:
+    """The encode used to take two inputs: frames on a pipe, and the source file
+    for its audio.  They run at wildly different speeds -- a frame arrives once
+    the depth model and an 8K render are done with it, the file reads at disk
+    speed -- and ffmpeg buffers the soundtrack until the picture catches up.  On
+    a long clip that is the whole soundtrack held in memory, which is how a
+    conversion came to die of an ffmpeg allocation failure rather than of
+    anything we did.  So the picture is written alone and the sound put back
+    after, where both sides are files."""
+
+    def _args(self, monkeypatch, out, info, settings, **kwargs):
+        seen = []
+        monkeypatch.setattr(video.subprocess, "Popen", lambda args, **kw: seen.append(args))
+        video._encoder(out, info, video.geometry(info, settings), settings, None, **kwargs)
+        return seen[0]
+
+    def test_the_encode_reads_one_input_and_it_is_the_pipe(self, monkeypatch, clip, tmp_path):
+        info = video.probe(clip)
+        args = self._args(monkeypatch, tmp_path / "out.mp4", info, video.VideoSettings())
+        assert args.count("-i") == 1
+        assert args[args.index("-i") + 1] == "-"
+
+    def test_and_says_nothing_about_audio(self, monkeypatch, clip, tmp_path):
+        info = video.probe(clip)
+        args = self._args(monkeypatch, tmp_path / "out.mp4", info, video.VideoSettings())
+        assert not [a for a in args if a.startswith("-c:a") or a == "-map"]
+
+    def test_the_remux_copies_the_picture_rather_than_encoding_it_again(
+            self, monkeypatch, clip, tmp_path):
+        seen = []
+        info = video.probe(clip)  # before run is stood on, since probe needs it
+        monkeypatch.setattr(video.subprocess, "run",
+                            lambda args, **kw: seen.append(args) or _Ran())
+        video._remux(tmp_path / "picture.mp4", clip, tmp_path / "out.mp4", info,
+                     video.VideoSettings(), None)
+        args = seen[0]
+        assert args[args.index("-c:v") + 1] == "copy"
+        # Both sides are files, so neither waits on the other.
+        assert args.count("-i") == 2
+        # And the index is moved to the front here, since the encode no longer
+        # does it -- a big file must not be rewritten twice.
+        assert "+faststart" in args
+
+    def test_the_encode_leaves_faststart_to_the_remux(self, monkeypatch, clip, tmp_path):
+        info = video.probe(clip)
+        args = self._args(monkeypatch, tmp_path / "out.mp4", info, video.VideoSettings(),
+                          faststart=False)
+        assert "+faststart" not in args
+
+    def test_but_does_it_itself_when_there_is_no_sound_to_add(self, monkeypatch, clip, tmp_path):
+        info = video.probe(clip)
+        args = self._args(monkeypatch, tmp_path / "out.mp4", info, video.VideoSettings())
+        assert "+faststart" in args
+
+
+class TestHugeFramesGiveUpFrameParallelism:
+    """x264 and x265 hold several frames at once -- lookahead, references, and a
+    copy per frame thread -- so their memory is a multiple of the frame.  At 8192
+    square a yuv420p frame is 100 MB and the default multiple does not fit in
+    anything.  Slice threading uses the cores inside one frame instead, which at
+    this size costs nothing: a frame that tall is more CTU rows than any desktop
+    has threads."""
+
+    def test_an_ordinary_frame_is_left_alone(self):
+        assert video._thrift("libx265", 1920, 1080) == []
+        assert video._thrift("libx264", 1920, 1080) == []
+
+    def test_a_vr180_frame_holds_one_at_a_time(self):
+        args = video._thrift("libx265", 8192, 8192)
+        assert "frame-threads=1" in args[args.index("-x265-params") + 1]
+
+    def test_and_x264_slices_instead(self):
+        args = video._thrift("libx264", 8192, 8192)
+        assert "sliced-threads=1" in args[args.index("-x264-params") + 1]
+
+    def test_a_hardware_encoder_is_not_told_about_x265_options(self):
+        assert video._thrift("hevc_nvenc", 8192, 8192) == []

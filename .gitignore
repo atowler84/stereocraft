@@ -8,3 +8,6 @@ image/
 *_depth.png
 *.egg-info/
 .pytest_cache/
+
+# The app writes its own log beside itself when run from the repo.
+logs/

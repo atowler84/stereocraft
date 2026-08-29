@@ -13,6 +13,7 @@ tk = pytest.importorskip("tkinter", reason="this Python was built without Tkinte
 from tkinter import filedialog  # noqa: E402
 
 from stereocraft import gui  # noqa: E402
+from stereocraft.pipeline import VideoSettings  # noqa: E402
 
 
 @pytest.fixture
@@ -108,6 +109,130 @@ class TestSettingsReachTheConversion:
         queued(app, monkeypatch, "holiday.jpg")
         photo, video = started(app, monkeypatch)
         assert photo.eyes_mm == "auto" and video.focus_m == "auto"
+
+
+class TestNotices:
+    """Anything the run has to say that is not the result.
+
+    These used to go to stderr, and the window is frozen with `console=False`
+    -- so a conversion that quietly did less than it was asked to said so to
+    nobody at all.  That is how "not enough memory to add detail" reached a user
+    as an unexplained wait.
+    """
+
+    def test_the_settings_carry_a_way_to_say_something(self, app, monkeypatch, tmp_path):
+        queued(app, monkeypatch, str(tmp_path / "a.mp4"))
+        photo, video = started(app, monkeypatch)
+        assert callable(photo.on_notice) and callable(video.on_notice)
+
+    def test_a_notice_goes_to_the_window_as_an_event(self, app):
+        """It is raised on the worker thread, so it cannot touch a widget
+        directly -- it goes through the same queue as everything else."""
+        app._notice("not enough memory to add detail; converting without it")
+        kind, payload = app.events.get_nowait()
+        assert kind == "notice" and "not enough memory" in payload
+
+    def test_the_summary_says_nothing_when_there_is_nothing(self, app, monkeypatch):
+        shown = []
+        monkeypatch.setattr(gui.messagebox, "showinfo", lambda *a: shown.append(a))
+        monkeypatch.setattr(gui.messagebox, "showerror", lambda *a: shown.append(a))
+        app._report([], [])
+        assert shown == []
+
+    def test_warnings_alone_are_not_an_error_dialog(self, app, monkeypatch):
+        kinds = []
+        monkeypatch.setattr(gui.messagebox, "showinfo", lambda *a: kinds.append("info"))
+        monkeypatch.setattr(gui.messagebox, "showerror", lambda *a: kinds.append("error"))
+        app._report([], ["ran without adding detail"])
+        assert kinds == ["info"]
+
+    def test_failures_and_warnings_share_one_dialog(self, app, monkeypatch):
+        """Two dialogs in a row is how people learn to dismiss the first."""
+        seen = []
+        monkeypatch.setattr(gui.messagebox, "showerror", lambda title, body: seen.append(body))
+        monkeypatch.setattr(gui.messagebox, "showinfo", lambda title, body: seen.append(body))
+        app._report(["clip.mp4: broke"], ["ran without adding detail"])
+        assert len(seen) == 1
+        assert "broke" in seen[0] and "without adding detail" in seen[0]
+
+
+class TestSliderReadings:
+    """Every reading a slider can show has to fit the column it shows it in.
+
+    The column is a fixed character width so the sliders line up, so anything
+    wider is cut off rather than squeezed -- and cut off further on Windows,
+    which lays this out in a wider font.  "off (black)" on the surround slider
+    was reaching the user as "off (black".
+    """
+
+    def test_every_reading_fits_its_column(self, app):
+        too_wide = []
+        for label, show, low, high in app._values:
+            for value in (low, (low + high) / 2, high, low + (high - low) * 0.01):
+                text = show(value)
+                if len(text) > gui.VALUE_WIDTH:
+                    too_wide.append((text, len(text)))
+        assert not too_wide, f"wider than {gui.VALUE_WIDTH} characters: {too_wide}"
+
+    def test_the_surround_says_off_at_zero(self, app):
+        """Rather than a number, which would read as a setting rather than as
+        the thing being switched off."""
+        app.surround.set(0.0)
+        readings = [label.cget("text") for label, *_ in app._values]
+        assert "off" in readings
+
+    def test_there_are_sliders_to_check(self, app):
+        """So the check above cannot pass by finding nothing."""
+        assert len(app._values) >= 6
+
+
+class TestProjectionControls:
+    """The VR180 settings, which have nothing to say about a flat pair and are
+    greyed rather than hidden so the window does not change shape as you look."""
+
+    def test_flat_is_the_default(self, app):
+        assert app.projection.get() == "flat"
+
+    def test_the_vr180_settings_are_offered_only_for_vr180(self, app):
+        app.projection.set("flat")
+        assert all("disabled" in w.state() for w in app._vr180_only)
+        app.projection.set("vr180")
+        assert all("disabled" not in w.state() for w in app._vr180_only)
+
+    def test_the_codec_is_left_on_auto(self, app):
+        """Which frame wants which codec is decided from the frame's own width
+        at encode time -- see `video.codec_for` -- so choosing the projection
+        does not need to reach over and change it."""
+        app.projection.set("vr180")
+        assert app.codec.get() == VideoSettings.codec == "auto"
+
+    def test_the_settings_reach_the_conversion(self, app, monkeypatch, tmp_path):
+        queued(app, monkeypatch, str(tmp_path / "a.jpg"))
+        app.projection.set("vr180")
+        app.surround.set(0.6)
+        app.upscale.set(True)
+        app.interpolate.set(True)
+        photo, video = started(app, monkeypatch)
+        assert photo.projection == video.projection == "vr180"
+        assert photo.vr180_surround == video.vr180_surround == 0.6
+        assert video.upscale and video.interpolate
+
+    def test_they_are_off_unless_asked(self, app, monkeypatch, tmp_path):
+        queued(app, monkeypatch, str(tmp_path / "a.mp4"))
+        photo, video = started(app, monkeypatch)
+        assert photo.projection == "flat"
+        assert photo.vr180_surround == 0
+        assert not video.upscale and not video.interpolate
+
+    def test_reset_puts_them_all_back(self, app):
+        app.projection.set("vr180")
+        app.surround.set(1.5)
+        app.upscale.set(True)
+        app.interpolate.set(True)
+        assert not app._general_at_default() and not app._video_at_default()
+        app.reset_general()
+        app.reset_video()
+        assert app._general_at_default() and app._video_at_default()
 
 
 class TestWhatIsOffered:
@@ -236,7 +361,7 @@ class TestReset:
         app.quality.set(72)
         app.reset_video()
         assert app.target.get() == 1.3 and app.temporal.get() == 0.5
-        assert app.crf.get() == 18 and app.codec.get() == "h264"
+        assert app.crf.get() == 18 and app.codec.get() == VideoSettings.codec
         assert app.audio.get() and not app.full_width.get()
         assert app.quality.get() == 72
 

@@ -52,6 +52,19 @@ class TestSettingsFor:
         s = cli.settings_for(parse("--eyes", "70", "--focus", "2.5", "x.jpg"), video=False)
         assert s.eyes_mm == 70.0 and s.focus_m == 2.5
 
+    def test_the_codec_is_left_to_the_frame(self):
+        """Not to the projection, which was the first thing tried and missed a
+        full-width flat pair off a 4K source -- 7448 across and past what a
+        headset decodes on h264."""
+        assert cli.settings_for(parse("x.mp4"), video=True).codec == "auto"
+        assert cli.settings_for(parse("--projection", "vr180", "x.mp4"),
+                                video=True).codec == "auto"
+
+    def test_an_explicit_codec_still_wins(self):
+        s = cli.settings_for(parse("--projection", "vr180", "--codec", "h264", "x.mp4"),
+                             video=True)
+        assert s.codec == "h264"
+
     def test_video_flags_reach_the_settings(self):
         s = cli.settings_for(parse("--codec", "hevc", "--crf", "22", "--temporal", "0.8",
                                    "--full", "--no-audio", "x.mp4"), video=True)
@@ -64,34 +77,61 @@ class TestNaming:
     setting, and getting it wrong shows the wrong thing rather than nothing."""
 
     @pytest.mark.parametrize("projection,cross,expected", [
-        ("flat", False, "_sbs"),
-        ("flat", True, "_sbs_cross"),
-        ("vr180", False, "_180_sbs"),
-        ("vr180", True, "_180_sbs_cross"),
+        ("flat", False, "_full_sbs"),
+        ("flat", True, "_full_sbs_cross"),
+        ("vr180", False, "_180x180_full_sbs"),
+        ("vr180", True, "_180x180_full_sbs_cross"),
     ])
     def test_every_combination_gets_its_own_name(self, projection, cross, expected):
         assert tag(Settings(projection=projection, cross_eyed=cross)) == expected
 
-    def test_vr180_carries_both_tokens_a_player_reads(self):
-        """180 sets the projection and sbs the layout, and players key on the two
-        of them separately -- which is why it is not just "_vr180"."""
-        name = tag(Settings(projection="vr180"))
-        assert "180" in name and "sbs" in name
+    def test_the_angle_is_spelled_the_way_the_rules_spell_it(self):
+        """A bare "180" is not on any player's list of keywords -- 180x180 is.
+        The clip that taught us this played on a cinema screen."""
+        assert "180x180" in tag(Settings(projection="vr180"))
 
-    def test_the_flat_name_has_not_moved(self):
-        """Everything already converted is called this, and renaming it would
-        orphan a library to no purpose."""
-        assert tag(Settings()) == "_sbs"
+    def test_vr180_carries_both_tokens_a_player_reads(self):
+        """The angle sets the projection and the layout sets the arrangement,
+        and players key on the two of them separately -- which is why it is not
+        just "_vr180"."""
+        name = tag(Settings(projection="vr180"))
+        assert "180x180" in name and "sbs" in name
+
+    def test_a_photo_says_its_eyes_are_full_width(self):
+        """Because they are, and because a still with nothing said about it is
+        assumed to be half width and stretched across twice the width it
+        belongs in."""
+        assert tag(Settings()) == "_full_sbs"
+        assert tag(Settings(projection="vr180")).endswith("_full_sbs")
+
+    @pytest.mark.parametrize("projection,full,expected", [
+        ("flat", False, "_hsbs"),
+        ("flat", True, "_full_sbs"),
+        # vr180 sizes the frame from the projection rather than from the source,
+        # so every eye is whole whatever `--full` says.
+        ("vr180", False, "_180x180_full_sbs"),
+        ("vr180", True, "_180x180_full_sbs"),
+    ])
+    def test_a_clip_says_which_width_its_eyes_are_at(self, projection, full, expected):
+        assert tag(VideoSettings(projection=projection, full_width=full)) == expected
 
     def test_the_photo_path_uses_it(self, tmp_path):
         out = output_path(tmp_path / "a.jpg", None, "auto", tag(Settings(projection="vr180")))
-        assert out.name == "a_180_sbs.jpg"
+        assert out.name == "a_180x180_full_sbs.jpg"
 
     def test_the_video_path_uses_it(self, tmp_path):
         from stereocraft import video
         out = video.output_path(tmp_path / "a.mov", None,
                                 tag(VideoSettings(projection="vr180", cross_eyed=True)))
-        assert out.name == "a_180_sbs_cross.mp4"
+        assert out.name == "a_180x180_full_sbs_cross.mp4"
+
+    @pytest.mark.parametrize("old", ["a_sbs.jpg", "a_sbs_cross.jpg",
+                                     "a_180_sbs.jpg", "a_180_sbs_cross.mp4"])
+    def test_a_library_an_earlier_version_wrote_is_still_left_alone(self, tmp_path, old):
+        """The names changed; a folder full of the old ones must not be
+        converted all over again because of it."""
+        (tmp_path / old).write_bytes(b"x")
+        assert cli.collect([str(tmp_path)]) == []
 
 
 class TestCollect:
@@ -127,3 +167,41 @@ class TestClock:
     @pytest.mark.parametrize("seconds,expected", [(0, "0s"), (45, "45s"), (90, "1m30s"), (3700, "1h01m")])
     def test_reads_the_way_someone_waiting_would_say_it(self, seconds, expected):
         assert cli.clock(seconds) == expected
+
+
+class TestOutpaint:
+    """The flag that fills the space around a vr180 clip with the scene it was
+    shot in.  Off unless asked, like the two passes beside it."""
+
+    def test_it_is_off_by_default(self):
+        assert parse("clip.mp4").outpaint is False
+
+    def test_asking_turns_it_on(self):
+        assert parse("--outpaint", "clip.mp4").outpaint is True
+
+    def test_it_reaches_the_video_settings(self):
+        settings = cli.settings_for(parse("--projection", "vr180", "--outpaint", "clip.mp4"),
+                                    video=True)
+        assert settings.outpaint is True
+
+    def test_a_photo_never_carries_it(self):
+        """A still has no other frames to gather a periphery from, so the flag
+        is a video one and `Settings` has no field for it at all."""
+        settings = cli.settings_for(parse("--outpaint", "photo.jpg"), video=False)
+        assert not hasattr(settings, "outpaint")
+
+
+class TestVersion:
+    def test_the_two_copies_of_it_agree(self):
+        """It lives in `stereocraft/__init__.py` and in `pyproject.toml`, and the
+        Windows build reads the second while `--version` prints the first. Bumped
+        singly they disagree silently, and the exe reports the version before the
+        one it is."""
+        import re
+        from pathlib import Path
+
+        from stereocraft import __version__
+
+        pyproject = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
+        declared = re.search(r'^version\s*=\s*"(.+)"', pyproject, re.MULTILINE).group(1)
+        assert declared == __version__

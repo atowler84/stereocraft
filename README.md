@@ -28,19 +28,24 @@ so the geometry goes back to being approximate. See [which
 model](#which-model).
 
 ```
-photo.jpg  ->  photo_sbs.jpg        (left | right, full width, no downscaling)
-clip.mp4   ->  clip_sbs.mp4         (left | right, half width per eye, sound kept)
+photo.jpg  ->  photo_full_sbs.jpg   (left | right, full width, no downscaling)
+clip.mp4   ->  clip_hsbs.mp4        (left | right, half width per eye, sound kept)
 ```
 
-The name says what the file is, because nothing inside it does — players pick
-the projection out of the file name and nowhere else:
+The name says what the file is, because nothing inside it does — players pick the
+projection out of the file name and nowhere else, and they do it by matching
+exact tokens:
 
 ```
-_sbs             flat, left | right
-_sbs_cross       flat, right | left, for cross-eyed free-viewing
-_180_sbs         VR180, left | right          (--projection vr180)
-_180_sbs_cross   VR180, right | left
+_hsbs                    flat, left | right, half width per eye  (a clip)
+_full_sbs                flat, left | right, full width per eye  (a photo, or --full)
+_180x180_full_sbs        VR180, left | right          (--projection vr180)
+_180x180_full_sbs_cross  VR180, right | left
 ```
+
+`180x180` is the angle, `full_sbs`/`hsbs` the layout and the width of an eye, and
+both halves have to be there. See [what the name has to
+say](#what-the-name-has-to-say).
 
 ## Install
 
@@ -91,6 +96,32 @@ published; the build installs it past that, and it runs on 3.14 unchanged.
 ```powershell
 powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1
 ```
+
+### Building from a WSL checkout
+
+PyInstaller cannot cross-compile, so the build has to run on the Windows side —
+but the checkout does not have to live there. PowerShell reads a WSL path
+directly, and `build.ps1` copies the source to a local disk before it starts for
+exactly this reason:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File \\wsl.localhost\Ubuntu\home\you\stereocraft\packaging\windows\build.ps1 -Cuda
+```
+
+Or from inside WSL, which is the same thing said the other way round:
+
+```bash
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w packaging/windows/build.ps1)" -Cuda
+```
+
+What it needs on the Windows side: a Python from 3.10 to 3.14 (`py -0p` lists
+what is installed), and room to work in — about 5 GB, or 13 GB with `-Cuda`.
+
+The build folder is worth keeping between builds. `<Work>\models` and
+`<Work>\ffmpeg` save re-downloading 1.5 GB of weights and a copy of ffmpeg, and
+`<Work>\venv-cuda` saves fetching Torch again — a rebuild after a code change
+then takes minutes rather than the best part of an hour. Everything else under
+it is disposable.
 
 It leaves a zip in `%USERPROFILE%\StereoCraft-build`. Unzip it anywhere -- a USB
 stick is fine -- and double-click `StereoCraft.exe` for the window, or run
@@ -459,13 +490,17 @@ knowing before trusting a `--save-depth` map as a measurement.
 | `--limit` | `3.0` | Ceiling on separation, as a percentage of frame width, so something very close cannot demand more parallax than an eye can fuse. |
 | `-m`, `--model` | `da3` | `da3` measures depth in metres. `da2-large`, `da2-base`, `da2-small` only rank it and are fitted onto an assumed range — a fallback, see [which model](#which-model). |
 | `--depth-size` | `auto` photo, `1400` video | Longest side fed to the depth network (shortest, for the `da2` models). `auto` follows the photo up to 2048 px; bigger gives cleaner subject silhouettes, which is what the warp cares about. A clip is pinned, since the finer structure is what the temporal smoothing then averages away. |
-| `--cross` | off | Write right\|left for cross-eyed viewing instead of left\|right. Not a quality setting: it only matters when free-viewing on a monitor. Named `_sbs_cross`, because shown to a headset as an ordinary pair it puts each eye on the other one's view. |
+| `--cross` | off | Write right\|left for cross-eyed viewing instead of left\|right. Not a quality setting: it only matters when free-viewing on a monitor. Adds `_cross` to the name, for the human reading the folder — no player has a word for it, and shown to a headset as an ordinary pair it puts each eye on the other one's view. |
 | `--max-size` | `0` | Cap the output width. Native by default; useful if a viewer chokes on very wide images. |
 | `--format`, `-q` | `auto`, `95` | Output container and JPEG quality. |
 | `--save-depth` | off | Also write a 16-bit `_depth.png`, near white and far black, scaled across its own range so it can be looked at. The two distances it scaled by go in the PNG's metadata as `stereocraft:near_m` and `stereocraft:far_m`, so `metres = far - (value / 65535) * (far - near)` gets them back. Read [where the metres come from](#where-the-metres-come-from) before trusting them. |
 | `--projection` | `flat` | `flat` writes a rectilinear pair, shown on a virtual screen. `vr180` wraps the same geometry onto a hemisphere at its true angular scale — see [VR180](#vr180). |
-| `--vr180-size` | `auto` | Stored width per eye for `--projection vr180`. `auto` keeps as much of the source's own detail as fits, capped at 4096 (2048 for a clip). |
-| `--vr180-surround` | off | Fill the part of the sphere the picture never reached with a dim, blurred spread of it, rather than leaving it black. A fixed function of each frame, so a clip cannot crawl with it. |
+| `--vr180-size` | `auto` | Stored width per eye for `--projection vr180`. The frame is the ceiling rather than what the source can fill: 4096 for a photo, and for a clip whatever its frame rate leaves the decoder — 4096 up to 60fps, 3344 at 90, 2896 at 120. |
+| `--vr180-surround` | `0` | Brightness of a blurred spread of the picture filling the part of the sphere it never reached, `0` for black. A fixed function of each frame, so a clip cannot crawl with it. Above `1` is brighter than the picture, for a scene too dark to light itself. |
+| `--upscale` | off | Video only. Put real detail into a clip too small to fill the frame, before converting. Acts only when the source is short of the ceiling. |
+| `--upscale-detail` | `0.75` | How much of the upscaler's own picture to keep against a plain enlargement of the source, 0 to 1. Turn it down when a clip comes back looking painted rather than filmed; `0` adds no detail at all. |
+| `--interpolate` | off | Video only. Raise a clip below 59fps to 60 before converting, motion compensated. |
+
 | `--device` | `auto` | `cuda`, `mps` or `cpu`. |
 | `--oversize` | `ask` | A photo too big for memory: `ask` what to do, `skip` it, or `resize` it to the largest size that fits. |
 
@@ -475,7 +510,7 @@ Video only:
 | --- | --- | --- |
 | `--temporal` | `0.5` | How much of the previous frame's depth to carry over, 0 to 0.95. Steadies a clip that shimmers, at a little edge sharpness; `0` turns it off. |
 | `--full` | off | Keep every native pixel, doubling the frame width, instead of squeezing each eye to half width. Needs a player that will decode it. |
-| `--codec` | `h264` | `hevc` is worth it above 4K, where h264 runs out of level. Which encoder produces it depends on the ffmpeg to hand — see [which encoder does the writing](#which-encoder-does-the-writing). |
+| `--codec` | `auto` | `auto` writes h264 where a headset will decode it and `hevc` where it will not, which is past 4096 across — every VR180 frame, and a full-width flat pair off a 4K source. Not a preference for HEVC: h264 plays on more, and CRF does not mean the same number in the two encoders. Which encoder produces it depends on the ffmpeg to hand — see [which encoder does the writing](#which-encoder-does-the-writing). |
 | `--crf` | `18` | Encoder quality; lower is better and larger. Means the same thing whichever encoder runs, though they spell it differently underneath. |
 | `--no-audio` | off | Leave the soundtrack behind rather than carrying it across. |
 
@@ -495,26 +530,31 @@ pip install -e ".[dev]"
 pytest -m "not slow"
 ```
 
-That is 89 of them in under two seconds — the geometry against the formula it is
-supposed to implement, the automatically chosen baseline landing on target from a
-0.2 m close-up to a 20 m telephoto, what the memory budget will and will not
-offer, argument handling, and the video plumbing. None of it needs the depth
-model.
+That is 415 of them in about five seconds — the geometry against the formula it
+is supposed to implement, the automatically chosen baseline landing on target
+from a 0.2 m close-up to a 20 m telephoto, what the memory budget will and will
+not offer, argument handling, the video plumbing, and the periphery pass's
+registration and combining. None of it needs the depth model.
 
 ```bash
 pytest
 ```
 
-runs the other nine as well, which convert a real photo and a real clip end to
-end and take about half a minute, most of it loading the model.
+runs the other 30 as well, which convert a real photo and a real clip end to end
+and take about half a minute, most of it loading the models.
 
-They exist because two bugs got past careful manual checking in a single week.
-`-shortest` quietly trimmed three frames off a ninety-frame clip and survived a
-verification pass that counted frame *sizes* rather than frames. `--save-depth`
-started writing centimetres, which is correct and looks like a black rectangle,
-and survived because nothing asserted the map was legible. Both now have a test
-named after what went wrong, and the second was checked by putting the bug back
-and watching three of them fail.
+They exist because bugs kept getting past careful manual checking. `-shortest`
+quietly trimmed three frames off a ninety-frame clip and survived a verification
+pass that counted frame *sizes* rather than frames. `--save-depth` started
+writing centimetres, which is correct and looks like a black rectangle, and
+survived because nothing asserted the map was legible. And `PYTORCH_JIT=0`, set
+in the frozen build's launcher so that one Depth Anything decorator would stop
+compiling from source it no longer had, also replaced `RecursiveScriptModule`
+with a stub — which took `torch.jit.load` with it, and so the painted edge of the
+surround simply never appeared in the packaged app while working perfectly from
+the checkout. Each now has a test named after what went wrong, and the last of
+them is asserted from the syntax tree so that the paragraph explaining the
+history does not count as repeating it.
 
 ## How it works
 
@@ -561,7 +601,7 @@ It is also mostly black, and that is not a bug to be fixed later.
 
 ```
 stereocraft --projection vr180 photo.jpg
-photo_180_sbs.jpg  3536x1768  4mm@0.3m  25% of a sphere (28mm assumed)
+photo_180x180_full_sbs.jpg  8192x4096  4mm@0.3m  25% of a sphere (28mm assumed)
 ```
 
 The `25% of a sphere` is how much of the hemisphere the photograph reaches, by
@@ -594,25 +634,70 @@ does not fill the frame. It reads as the light coming off the picture rather
 than as a second, blurrier photograph, and it makes an enormous difference to
 how a 15%-covered frame feels to sit inside.
 
-It earns its place for the reason an outpainting model does not: it is a **fixed
-function of the frame**, so it moves exactly as the picture moves and cannot
-crawl or boil between frames. Nothing is invented that was not already on
-screen. Two things differ from the rectangular case, both because this is a
+It earns its place for the reason a *per-frame* outpainting model does not: it is
+a **fixed function of the frame**, so it moves exactly as the picture moves and
+cannot crawl or boil between frames. Nothing is invented that was not already on
+screen. The wash now also meets the picture at the picture's *own* brightness and
+eases to the level you asked for over the next 25°, which takes the step across
+that boundary from 75 of 255 to 53 — the rest is inherent, a blur being unable to
+match a sharp edge locally. Widening the fade instead was tried and does not
+help: it dims the photograph rather than lifting the wash. Two things differ from the rectangular case, both because this is a
 sphere — the wash is spread outward from the edge rather than scaled up from the
 middle, so what sits beside you is the colour the camera saw *in that
 direction*; and both eyes get the same wash, because a periphery with a parallax
 of its own would fight the real picture over where your eyes should converge.
 
+`--vr180-surround` takes a brightness. `0` is off, `0.45` is a good starting
+point, `1.0` is the picture's own light undimmed — and above that it keeps
+going, because a dark scene spreads a dark wash and turning the number up is
+the only way to light one. Past 1 the wash is screened into itself rather than
+multiplied and clamped: `1 - (1 - w)ⁿ`, which reaches for white without ever
+arriving, so a bright corner never flattens into a colourless blob where the
+eye is most easily caught. At exactly 1 the two halves are the same function, so
+a number chosen by eye keeps meaning what it meant.
+
+```bash
+stereocraft --projection vr180 --vr180-surround 2.0 photo.jpg
+```
+
 It costs nothing measurable in time, and about 0.03 MB in size — a smooth blur
 is almost free to compress. The reported coverage does not move, because it
 counts what the camera saw and not what was painted in.
 
-**Resolution.** The square is sized to keep the photograph's own detail where
-it can, which for a 65-degree lens means a side nearly three times the source
-width, capped at 4096 for a photo and 2048 for a clip. Past the cap the picture
-is used softer than it arrived: a 49mm photo at 4096 comes back 918 pixels wide
-with fifteen megapixels of black around it. `--vr180-size` sets the stored width
-by hand.
+**Resolution.** The frame is the ceiling, whatever the source. A headset shows
+25 pixels a degree whatever it is handed, so a frame short of that is visibly
+soft however faithfully it matches what went in.
+
+The ceiling is 4096 an eye for a photo. For a clip it comes from the frame rate,
+a hardware decoder being limited by pixels per second rather than by pixels —
+a Quest 3 takes 8192×4096 at 60fps, 6688×3344 at 90 and 5792×2896 at 120:
+
+| clip | frame | per eye | pixels per degree |
+| --- | --- | --- | --- |
+| ≤60fps | 8192 × 4096 | 4096 | 22.8 |
+| ≤90fps | 6688 × 3344 | 3344 | 18.6 |
+| >90fps | 5792 × 2896 | 2896 | 16.1 |
+
+A Quest 3's own display is 25 pixels per degree, so the 60fps ceiling is about
+as much as it can show.
+
+Whether a *source* can fill that ceiling is a separate question, and the answer
+depends on its width — which is why portrait video, the shape a phone records,
+mostly cannot:
+
+| source | could fill | ceiling | short by |
+| --- | --- | --- | --- |
+| 720 × 1280 | 1980 | 4096 | **52%** |
+| 1080 × 1920 | 2968 | 4096 | 28% |
+| 1920 × 1080 | 5279 | 4096 | — |
+
+1490 pixels of width is all it takes to fill a 4096 ceiling, so anything shot
+landscape at 1080p or better already has the detail. Anything narrower does not,
+and `--upscale` is what puts it there.
+
+`--vr180-size` sets the stored width by hand. A 60fps frame is about 4.3 GB of
+working memory and several seconds each, so this is the setting to turn down if
+a long clip is taking longer than it is worth.
 
 **It is a different question from the flat path, so it is asked differently.**
 `--target` and `--limit` are percentages of frame width, and a percentage of a
@@ -641,6 +726,13 @@ bounds — which is not a VR180 special case at all, a VR180 file being a
 writes neither, so the boxes are spliced in afterwards and every chunk offset in
 the file moved to match.
 
+The photo's XMP describes one eye and the file holds two, so it does **not** set
+`UsePanoramaViewer`. That flag asks a viewer to wrap the frame it has round a
+sphere, which of a 2:1 side-by-side pair is exactly how a monoscopic 360
+panorama declares itself — believed, it puts both eyes round the sphere at twice
+the width they belong at. The numbers stay for anything that splits the pair
+first; the claim goes.
+
 None of which any player has yet been observed to act on beyond the projection
 itself, which is why nothing tighter than the format's own hemisphere is written.
 `--cross` writes stereo mode 4, right-left, which ffmpeg itself discards —
@@ -651,51 +743,196 @@ One consequence worth knowing: a VR180 clip carries `st3d`, so a **desktop**
 player that reads it will show a single eye rather than the side-by-side pair.
 That is the metadata working. Use `--projection flat` for 2D spot checks.
 
-**The one thing it still does not do** is invent the periphery, which is the
-honest state of the art: a 512-tall diffusion model filling 85% of the frame,
-hallucinated depth behind hallucinated colour, on an app whose whole argument is
-that its geometry is measured rather than guessed — and on a clip, boiling
-differently in every frame. `--vr180-surround` is the part of that idea worth
-having: it lights the dark without pretending to know what was in it.
+### What the name has to say
 
-Video takes the flag too. The frame has to be settled before the first one is
-decoded — every frame must come out the size of the first — and no clip carries
-a focal length, so it assumes the same 28mm `depth` falls back on. A moving
-picture is still the weaker case: the square costs the pixels and the missing
-periphery is missing either way. `--projection flat` remains the default
-everywhere.
+The metadata above is the careful half and the file name is the half that
+actually gets read. Skybox — and it is not alone — matches tokens out of the
+name and goes no further, and its published list is short and literal:
+
+| | tokens |
+| --- | --- |
+| angle | `360`, `180x180` — **not a bare `180`** |
+| layout | `sbs`, `lr`, `3dh` for a pair; `hsbs`/`half sbs` for half width per eye; `full sbs` for full |
+| fisheye | `f180`, `vr180` — a *different projection*, and not what this writes |
+
+Separators and capitalisation do not matter, so `full_sbs` and `Full SBS` are the
+same token. Missing tokens are not asked about, they are assumed, and the two
+assumptions are the two things that went wrong here:
+
+- **No angle → a cinema screen.** A clip named `_180_sbs` carries a layout and no
+  angle at all, because `180` on its own is not on the list. The player finds a
+  side-by-side pair, finds no projection, and hangs it on a flat screen in a
+  virtual room — the geometry all correct, and none of it on the sphere.
+- **No width → half width, and a stretch.** A still with nothing said about its
+  layout is assumed to be half width per eye and stretched back out to twice
+  what it stored. Every eye this writes is a full-width square, so that doubles
+  the width of everything in it.
+
+Hence `_180x180_full_sbs`, which says both, spelled the way the rules spell them.
+`--full`-less flat clips say `_hsbs` instead, being the one output whose eyes
+really are squeezed. If a player still guesses wrong it will have a setting for
+it, and Skybox's is Stereo Mode plus Full SBS matching.
+
+**The folder counts as part of the name**, which is worth knowing before filing
+any of this: a folder called `VR180` puts the fisheye token on everything inside
+it, and fisheye is a different projection from the equirectangular one written
+here — it will look wrong in a way that has nothing to do with the files. Call
+the folder something without a keyword in it.
+
+### Making a clip big enough to fill it
+
+`--upscale` and `--interpolate` run before the conversion, as a pass of their
+own. They have to: the super-resolution model peaks at 9.4 GB on a 720×1280
+chunk, and the 8192×4096 render peaks at 4.3 GB with the depth model holding
+2 GB behind it. On a 16 GB card those do not fit together.
+
+**Upscaling is temporal, not per-frame.** RealBasicVSR propagates features along
+the clip in both directions, so what it invents is anchored to what it invented
+either side. Real-ESRGAN is smaller and faster and has no concept of time: the
+detail it invents at one frame differs from the next, and the picture crawls —
+the same boil that made a blurred surround the right answer for the periphery,
+and that `--outpaint` was built to get around, by making the periphery once a
+shot rather than once a frame.
+The cost is that frames near the end of a sequence have seen less of it than
+those in the middle, so chunks overlap by six frames and throw the edges away.
+
+**Why an upscaled clip used to look like a cartoon**, and the two halves of the
+fix. RealBasicVSR is a cleaning module in front of a super-resolution one, and
+both of them were pushing the same way.
+
+The cleaning module ran twice here, on the belief that twice is what the
+reference does at test time. It is not: the reference runs it *at most* three
+times and stops the moment the residual it predicted is small, with a threshold
+that on a picture in [0, 1] every real frame meets on the first pass. So the
+reference cleans once and this cleaned twice — a denoiser run over the output of
+a denoiser. On footage that arrived clean there is no compression left to find by
+then, so what the second pass takes off is the picture's own texture: skin to
+wax, foliage to a green mass. That is now the reference's rule, and it is a
+straight bug fix with no setting attached.
+
+The other half is not a bug. RealBasicVSR was trained on synthetic footage
+degraded far past anything a phone produces, and handed something cleaner it
+still reconstructs with the confidence it learnt on the wreckage — pores, weave
+and leaves come back as smooth, decided shapes, plausible and not what was there.
+The network adds a residual to a plain enlargement, so blending back towards that
+enlargement is a dial on exactly how much of it to keep: `--upscale-detail`,
+`0.75` by default, `0` for an honest resample and nothing invented. Unlike most
+numbers in this project it is not measured, because what is being traded is how
+much invented detail reads as too much, which is taste and how close the headset
+puts it.
+
+**Interpolation is RIFE**, and targets 60 and not more, because the decode
+ceiling falls as frame rate rises — 90fps would cost 18% of the angular
+resolution to buy smoothness the headset was not short of. Rates need not
+divide: 24 and 50 reach exactly 60, because the network is asked for an instant
+rather than a midpoint.
+
+Measured against real frames with the answers held out, RIFE reconstructs them
+at **35.19 dB** where ffmpeg's `minterpolate` manages 29.66 and holding the
+previous frame gets 16.31. `minterpolate` is still the fallback where the
+weights are missing.
+
+Both act only when the clip needs them — a 1080p60 landscape clip gets neither —
+so leaving them on costs nothing on footage that has nothing to gain. When they
+do act, each roughly doubles the time, and together they can take several times
+as long as the conversion itself.
+
+### Filling the periphery: what was tried, and why it is off
+
+`--outpaint` is not in `--help` and has no box in the window, and it ships with
+no weights. It still works if weights are put where it looks. It builds a plate
+once per shot and widens it with a model, so the periphery cannot boil the way a
+per-frame fill would.  The reasoning holds and the
+machinery works.  It is off, and shipped without weights, because on the footage
+it was built for it does not produce something worth looking at.  What follows is
+the record, because the next person to try this deserves the measurements rather
+than the idea.
+
+**The idea.** Boil comes from generating per frame.  Generate once per shot and
+there is only one answer to differ from.  Register the shot, mosaic what the
+camera really saw, widen that with a model on a flat perspective canvas -- flat,
+because a model trained on photographs has never seen an equirectangular frame --
+and project the result onto the sphere.
+
+**Four things that were measured, and three that failed.**
+
+- *LaMa bands.*  Given an indoor close-up it continues a bed line and a headboard
+  as flat horizontal stripes: facet ratio 22.7, where a photograph sits near 9.
+  No amount of work on the blending moves it.  FLUX Fill came back at 8.5.
+- *A hard rectangular mask gets a picture frame painted round it* -- wooden
+  slats, mitred corners.  Feathering the mask and denoising from the picture
+  *stretched* over the canvas rather than blurred in place is what turns that
+  into a continuation.  Blurring in place is a halo, and a halo is still a
+  rectangle.
+- *Registration locks onto the subject.*  On a close-up the person is most of the
+  frame and therefore most of the features, so an unmasked fit reports 64 degrees
+  of yaw where the camera turned 21.  Registering on the far field alone fixes
+  it -- and a depth quantile is not good enough to find the far field, because it
+  puts a head on the room's side of the split.  Person segmentation is.
+- *And the one that ends it.*  A plate is fixed for a shot; a subject is not.
+  Widening a frame extends the subject along with the room, and the extension
+  then sits frozen beside a picture that moves.  Measured on real footage, the
+  plate and the live frame agree geometrically -- overlapping boxes, 0.2659
+  against the live frame's own 0.2664 -- and differ by 0.117 in content, because
+  one is frame 0 and the other is frame 90.  That reads exactly as the original
+  duplicated over itself, and it is not a bug to be fixed but the shape of the
+  problem.
+
+**What nearly worked.**  Segmenting the person out of every frame and
+accumulating only the room, across the whole clip, gives a real room: she moves
+enough to uncover 74.8% of the frame over 96 seconds, and the plate reaches 52%
+of the sphere in real photography, 13 times what one frame shows.  Conditioning
+on that took the model from 21% real input to 69%.  The remaining problem is
+sharpness: median-stacking blurs, because the registration is not accurate to a
+pixel, and picking the best observation per pixel instead shreds -- 23.8% of
+covered pixels end up on a seam.  Seam-finding brings that to 7.2% and
+refining the registration to 6.7%, and neither is sharp.
+
+So it stops here.  What the periphery gets instead is the wash, which is
+described above and which was improved in the course of finding all this out.
 
 ## Viewing
 
 A photo comes out full-width SBS: each eye keeps its own full width, so the file
-is twice as wide as the source. A clip comes out half-width per eye, at the size
-it went in, which is the arrangement players and their hardware decoders expect —
-`--full` overrides that.
+is twice as wide as the source, and the name says `_full_sbs` so no player has to
+guess. A flat clip comes out half-width per eye and named `_hsbs`, at the size it
+went in, which is the arrangement players and their hardware decoders expect —
+`--full` overrides that. A VR180 clip is always full width per eye, the frame
+being sized by the projection rather than by the source.
 
 Quest, Pico and Vision Pro read both directly through any local media viewer; on
 a desktop, free-viewing works with the parallel method, or use `--cross` and
 cross your eyes.
 
-Nothing in an mp4 or a JPEG announces how it is meant to be looked at, so
-players go by the file name — which is why each kind of output carries its own.
-`_sbs` and `_180_sbs` are both widely recognised, the second carrying the two
-tokens players key on separately: `180` sets the projection, `sbs` the layout. A
-player that still guesses wrong has a setting for it.
+Nothing in an mp4 or a JPEG announces how it is meant to be looked at, so players
+go by the file name — which is why each kind of output carries its own, and why
+the exact spelling matters more than it looks. [What the name has to
+say](#what-the-name-has-to-say) is the whole of it, and worth reading before
+renaming anything: a `180` where `180x180` belongs is the difference between a
+sphere and a cinema screen.
 
 Those names are also how a second run over the same folder knows to leave its own
 output alone, so renaming a file back to something plain will get it converted
-again.
+again. Anything an earlier version wrote as `_sbs` or `_180_sbs` is still left
+alone; rename those to pick up the corrected tokens.
 
 ## License
 
 MIT, see [LICENSE](LICENSE).
 
-StereoCraft is MIT. Everything it depends on is Apache-2.0, BSD or MIT, with two
-exceptions worth knowing about if this folder is ever handed to anyone: the
+StereoCraft is MIT. Everything it depends on is Apache-2.0, BSD or MIT, with a
+few exceptions worth knowing about if this folder is ever handed to anyone: the
 bundled **ffmpeg is the GPL build**, chosen for x264 and x265, and **pillow-heif
 bundles libx265** in its wheel whether or not anything writes HEIC. The default
 depth weights are Apache-2.0; the `da2-base` and `da2-large` fallbacks are
 CC BY-NC 4.0 and not licensed for commercial use.
+
+**No `--outpaint` weights are shipped**, which sidesteps a licence question as
+well as a size one. Of the three backends it can use, LaMa's are a trace of
+`advimman/lama`'s big-lama — the mirror declares Apache-2.0, the authors publish
+under **CC BY-NC-SA 4.0**, and the stricter reading is the one to assume — and
+FLUX Fill's are non-commercial too. None of them is in the default `-Models`, so
+a stock build carries no non-commercial weights beyond the `da2` fallbacks.
 
 For using it yourself none of that matters, and none of it is legal advice.
 

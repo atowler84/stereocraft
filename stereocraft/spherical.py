@@ -12,10 +12,12 @@ Both formats have had a place to put it for years:
 **Stills** carry Google's GPano XMP, whose `CroppedArea*` and `FullPano*` fields
 exist precisely to say "this is a piece of a panorama, and here is where".  The
 fields describe one eye, which is the natural reading once a player has split a
-side-by-side frame -- and splitting it is what the `_180_sbs` in the name is for.
-It is the weaker half of this module: GPano has no vocabulary for a stereo pair
-in one frame, so the crop offsets are honest and the pairing is still carried by
-the file name.
+side-by-side frame -- and splitting it is what the `_180x180_full_sbs` in the
+name is for.  It is the weaker half of this module: GPano has no vocabulary for a
+stereo pair in one frame, so the crop offsets are honest and the pairing, the
+layout and the width of an eye are all still carried by the file name.  Skybox
+reads none of this and goes by the name alone -- see `pipeline.SBS_TAGS` for what
+that costs if the name is spelled even slightly wrong.
 
 **Video** carries the boxes from Google's Spherical Video V2, which does have a
 vocabulary for both: `st3d` says the frame holds two views side by side, and
@@ -50,12 +52,24 @@ _STSD_PATH = (b"mdia", b"minf", b"stbl", b"stsd")
 
 
 # --- stills -----------------------------------------------------------------
-def gpano(spot, heading=0.0):
+def gpano(spot, heading=0.0, viewer=False):
     """GPano XMP describing where one eye's picture sits on the sphere.
 
     `FullPano*` is the 360-degree frame the piece was cut from, and `CroppedArea*`
     is the piece and its offset.  A viewer that reads none of it still sees an
     ordinary photograph, which is the reason the fields are laid out this way.
+
+    **`UsePanoramaViewer` is False, and that is the whole of the difference
+    between a description and a claim.**  The fields above describe one eye; the
+    file they are written into holds two, side by side.  Set the flag and what
+    the file says is "show the frame you have in a panorama viewer, it is
+    equirectangular" -- which of a 2:1 side-by-side pair is exactly how a
+    monoscopic 360 panorama declares itself, and a viewer that believes it wraps
+    both eyes round the sphere at twice the width they belong at.  Left False the
+    same numbers are there for anything that splits the pair first, and nothing
+    is being asserted about the frame as a whole.  Reasoned rather than measured,
+    unlike the file name, where the rules are published and the symptom was
+    reproduced.
     """
     return (
         '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>'
@@ -63,7 +77,7 @@ def gpano(spot, heading=0.0):
         '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
         '<rdf:Description rdf:about="" '
         'xmlns:GPano="http://ns.google.com/photos/1.0/panorama/" '
-        'GPano:UsePanoramaViewer="True" '
+        f'GPano:UsePanoramaViewer="{"True" if viewer else "False"}" '
         'GPano:ProjectionType="equirectangular" '
         f'GPano:CroppedAreaImageWidthPixels="{spot.width}" '
         f'GPano:CroppedAreaImageHeightPixels="{spot.height}" '

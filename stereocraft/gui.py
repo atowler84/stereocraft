@@ -16,6 +16,7 @@ try:
 except ImportError:  # pragma: no cover - depends on the Python build
     tk = None
 
+from . import logbook
 from .pipeline import SUFFIXES, Converter, Settings, VideoSettings
 from .video import VIDEO_SUFFIXES, clock, convert_video
 
@@ -29,6 +30,10 @@ PREVIEW_WIDTH = 620
 # How wide the explanatory line under a setting is allowed to run before it
 # wraps, which is what stops a long hint deciding how wide the window is.
 HINT_WIDTH = 560
+# Characters of room for a slider's reading.  Fixed so the sliders line up, and
+# generous because Windows lays this out in a wider font than Linux does -- the
+# surround slider's "off (black)" was cut to "off (black" there before this.
+VALUE_WIDTH = 10
 # The result sits on a dark mat, the way a print is mounted -- it is what a
 # side-by-side pair is easiest to judge against, and it stops a bright photo
 # glaring against the window behind it.
@@ -172,6 +177,7 @@ class App:
         self.preview = None
         self.finished = 0
         self.errors = []
+        self.notices = []
         self.cross_used = False  # the viewing order the current run is writing
 
         root.title("StereoCraft - side-by-side 3D")
@@ -380,6 +386,8 @@ class App:
         self._resets = []
         self._manual = []  # sliders that only apply when NOT matching the scene
         self._auto_only = []  # ...and the ones that only apply when it is
+        self._vr180_only = []  # ...and the ones with nothing to say about a flat pair
+        self._values = []  # every slider's reading, for the test that they all fit
         self._build_general(self.tabs)
         self.photo_tab = self._build_photo(self.tabs)
         self.video_tab = self._build_video(self.tabs)
@@ -424,7 +432,35 @@ class App:
         ttk.Checkbutton(box, text="Cross-eyed order (only for free-viewing without a headset)",
                         variable=self.cross).grid(row=6, column=0, columnspan=3, sticky="w",
                                                   pady=(4, 0))
-        self._reset_button(box, 7, self.reset_general, self._general_at_default)
+
+        # The projection, and under it the one setting that only means anything
+        # once it is a sphere.  Greyed rather than hidden when it is not, so the
+        # window does not change shape as you look at it.
+        self.projection = tk.StringVar(value=Settings.projection)
+        self.surround = tk.DoubleVar(value=Settings.vr180_surround)
+        self.projection.trace_add("write", lambda *_: self._refresh_controls())
+
+        row = ttk.Frame(box)
+        row.grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(row, text="Projection").pack(side="left")
+        for value, text in (("flat", "Flat (a screen in front of you)"),
+                            ("vr180", "VR180 (wrapped around you)")):
+            ttk.Radiobutton(row, text=text, value=value,
+                            variable=self.projection).pack(side="left", padx=(8, 0))
+        ttk.Label(box, text="VR180 puts the picture at its true angular size instead of on a"
+                            " screen the player scales to taste. Most of the sphere is dark,"
+                            " because a camera only ever pointed at part of it.",
+                  foreground="#777", wraplength=HINT_WIDTH, justify="left").grid(
+            row=8, column=0, columnspan=3, sticky="w")
+
+        self._vr180_only.append(self._slider(
+            box, 9, "Surround", self.surround, 0.0, 2.0,
+            lambda v: "off" if v < 0.02 else f"{v:.2f}",
+            "Fills the dark with a blurred spread of the picture, the way a social video site"
+            " does behind a clip that does not fill the frame. Above 1 it is brighter than the"
+            " picture was, for a scene too dark to light itself."))
+
+        self._reset_button(box, 11, self.reset_general, self._general_at_default)
 
     def _build_photo(self, tabs):
         """How much depth a still asks for, and what it is written as."""
@@ -505,7 +541,8 @@ class App:
         row = ttk.Frame(box)
         row.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Label(row, text="Codec").pack(side="left")
-        for value, text in (("h264", "H.264 (plays anywhere)"), ("hevc", "HEVC (better above 4K)")):
+        for value, text in (("auto", "Auto"), ("h264", "H.264 (plays anywhere)"),
+                            ("hevc", "HEVC (needed above 4K)")):
             ttk.Radiobutton(row, text=text, value=value, variable=self.codec).pack(side="left", padx=(8, 0))
 
         ttk.Checkbutton(box, text="Keep the soundtrack", variable=self.audio).grid(
@@ -515,7 +552,30 @@ class App:
         ttk.Label(box, text="Off squeezes each eye to half width, which is what players and"
                             " headsets expect and what their decoders can keep up with.",
                   foreground="#777", wraplength=HINT_WIDTH, justify="left").grid(row=9, column=0, columnspan=3, sticky="w")
-        self._reset_button(box, 10, self.reset_video, self._video_at_default)
+
+        # These only act when the clip is short of something, so leaving them on
+        # costs nothing on footage that has nothing to gain -- which is why they
+        # are plain checkboxes rather than numbers to get right.
+        # `outpaint` has no switch here on purpose.  It ships without weights --
+        # see the note at the top of `outpaint` for what was measured and why --
+        # so a box offering it would promise something the app cannot do.  The
+        # setting and the command-line flags are still there for anyone picking
+        # the experiment back up.
+        self.upscale = tk.BooleanVar(value=VideoSettings.upscale)
+        self.interpolate = tk.BooleanVar(value=VideoSettings.interpolate)
+        self._vr180_only.append(ttk.Checkbutton(
+            box, text="Add detail to a clip too small to fill the frame", variable=self.upscale))
+        self._vr180_only[-1].grid(row=10, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self._vr180_only.append(ttk.Checkbutton(
+            box, text="Smooth a clip slower than 60fps", variable=self.interpolate))
+        self._vr180_only[-1].grid(row=11, column=0, columnspan=3, sticky="w")
+        ttk.Label(box, text="Both run before the conversion and only when the clip needs them."
+                            " Each roughly doubles how long it takes, and together they can"
+                            " take several times as long as the conversion itself.",
+                  foreground="#777", wraplength=HINT_WIDTH, justify="left").grid(
+            row=12, column=0, columnspan=3, sticky="w")
+
+        self._reset_button(box, 13, self.reset_video, self._video_at_default)
         return box
 
     def _build_result(self, parent):
@@ -541,10 +601,18 @@ class App:
 
     def _slider(self, parent, row, label, variable, low, high, fmt, hint):
         """`fmt` is a format string, or a callable for a value the slider does not
-        hold directly -- focus distance being stored the other way up."""
+        hold directly -- focus distance being stored the other way up.
+
+        The value column is fixed so the sliders line up, which means a reading
+        wider than `VALUE_WIDTH` is not squeezed, it is cut off -- and worse on
+        Windows, whose default font is wider than the one this is laid out
+        against.  `_values` collects the labels so a test can check every
+        reading each slider can produce still fits.
+        """
         show = fmt if callable(fmt) else fmt.format
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
-        value = ttk.Label(parent, text=show(variable.get()), width=8, anchor="e")
+        value = ttk.Label(parent, text=show(variable.get()), width=VALUE_WIDTH, anchor="e")
+        self._values.append((value, show, low, high))
         # Watching the variable rather than the slider, so a value put back by a
         # Reset shows up the same as one dragged there.
         variable.trace_add("write", lambda *_: value.config(text=show(variable.get())))
@@ -573,12 +641,16 @@ class App:
         self.eyes.set(eyes)
         self.focus.set(1.0 / focus)
         self.cross.set(False)
+        self.projection.set(Settings.projection)
+        self.surround.set(Settings.vr180_surround)
 
     def _general_at_default(self):
         """What the eyes and the focus go back to follows the queue: a clip is
         recommended gentler than a still.  See `_sync_recommendation`."""
         return (self.automatic.get() and self._sliders_at(self.recommended)
-                and not self.cross.get())
+                and not self.cross.get()
+                and self.projection.get() == Settings.projection
+                and round(self.surround.get(), 2) == Settings.vr180_surround)
 
     def reset_photo(self):
         self.photo_depth.set(Settings.target_pct)
@@ -601,6 +673,8 @@ class App:
         self.codec.set(VideoSettings.codec)
         self.audio.set(VideoSettings.audio)
         self.full_width.set(VideoSettings.full_width)
+        self.upscale.set(VideoSettings.upscale)
+        self.interpolate.set(VideoSettings.interpolate)
 
     def _video_at_default(self):
         return (round(self.target.get(), 2) == VideoSettings.target_pct
@@ -608,7 +682,9 @@ class App:
                 and round(self.crf.get()) == VideoSettings.crf
                 and self.codec.get() == VideoSettings.codec
                 and self.audio.get() == VideoSettings.audio
-                and self.full_width.get() == VideoSettings.full_width)
+                and self.full_width.get() == VideoSettings.full_width
+                and self.upscale.get() == VideoSettings.upscale
+                and self.interpolate.get() == VideoSettings.interpolate)
 
     def _sliders_at(self, values):
         eyes, focus = values
@@ -713,6 +789,7 @@ class App:
             # what matching the scene aims for.
             *((slider, not self.automatic.get()) for slider in self._manual),
             *((slider, self.automatic.get()) for slider in self._auto_only),
+            *((widget, self.projection.get() == "vr180") for widget in self._vr180_only),
             (self.quality_scale, self.fmt.get() != "png"),
         ):
             button.state(["!disabled"] if usable else ["disabled"])
@@ -756,6 +833,7 @@ class App:
         self.cancel.clear()
         self.finished = 0
         self.errors = []
+        self.notices = []
         for index in range(len(self.files)):
             self._set_row(index, "pending")  # a re-run starts everything over
         self._refresh_controls()
@@ -766,6 +844,9 @@ class App:
             eyes_mm="auto" if automatic else round(self.eyes.get(), 1),
             focus_m="auto" if automatic else round(1.0 / self.focus.get(), 3),
             cross_eyed=self.cross.get(),
+            projection=self.projection.get(),
+            vr180_surround=round(self.surround.get(), 2),
+            on_notice=self._notice,
             on_oversize=self._ask_oversize,
         )
         settings = (Settings(target_pct=round(self.photo_depth.get(), 2),
@@ -776,7 +857,8 @@ class App:
                                   temporal=round(self.temporal.get(), 2),
                                   crf=int(round(self.crf.get())), codec=self.codec.get(),
                                   audio=self.audio.get(), full_width=self.full_width.get(),
-                                  **common))
+                                  upscale=self.upscale.get(),
+                                  interpolate=self.interpolate.get(), **common))
         threading.Thread(target=self._work, args=(list(self.files), self.output_dir, settings),
                          daemon=True).start()
 
@@ -786,6 +868,16 @@ class App:
         self.cancel.set()
         self.status.config(text="Stopping...")
         self._refresh_controls()
+
+    def _notice(self, message):
+        """Something the run needs to say that is not the result.
+
+        Runs on the worker thread, so it goes to the main loop as an event like
+        everything else.  It exists at all because these used to go to stderr,
+        and the window is frozen with no console -- so a conversion that quietly
+        did less than it was asked to said so to nobody.
+        """
+        self.events.put(("notice", message))
 
     def _ask_oversize(self, oversize):
         """Put a too-large photo to the user.  Runs on the worker thread, so the
@@ -815,7 +907,8 @@ class App:
                 try:
                     if moving:
                         info = convert_video(path, output_dir, self.converter,
-                                             self._progress(index), self._previewer(path))
+                                             self._progress(index), self._previewer(path),
+                                             on_stage=self._stage(index))
                     else:
                         info = self.converter.convert(path, output_dir)
                 except Exception as error:
@@ -828,6 +921,31 @@ class App:
                 self.events.put(("done", (index, info)))
         finally:
             self.events.put(("finished", None))
+
+    def _stage(self, index):
+        """Report the passes that run before a conversion.
+
+        Adding detail and smoothing take minutes each, and a window that says
+        "converting" through both of them reads as a hang.  The queue bar is
+        deliberately left where it is -- these are not frames of the finished
+        clip, and advancing it here would only make it fall back when the
+        conversion proper started counting from nothing.
+        """
+        last = [0.0]
+
+        def report(label, done, total):
+            if self.cancel.is_set():
+                return False
+            now = time.monotonic()
+            if done and total and now - last[0] < 0.3:
+                return True
+            last[0] = now
+            share = f" {done}/{total}" if total else ""
+            self.events.put(("stage", (index, f"{label}{share}",
+                                       done / total if (done and total) else None)))
+            return True
+
+        return report
 
     def _progress(self, index):
         """Report a clip's frames back to the window, and carry the Stop button's
@@ -896,9 +1014,17 @@ class App:
                     reason = message.split(": ", 1)[-1]
                     self._set_row(index, "failed",
                                   reason if len(reason) <= 60 else reason[:57] + "...")
+            elif kind == "notice":
+                # On the status line as it happens, and kept for the summary --
+                # a long batch would otherwise scroll its warnings past unread.
+                self.notices.append(payload)
+                self.status.config(text=payload)
             elif kind == "ask":
                 oversize, reply = payload
                 reply.put(self._oversize_dialog(oversize))
+            elif kind == "stage":
+                index, text, fraction = payload
+                self._set_row(index, "working", text, fraction=fraction)
             elif kind == "frame":
                 index, done, total, left = payload
                 share = f"{done}/{total}" if total else f"{done}"
@@ -933,6 +1059,12 @@ class App:
                 note = f"  (resized from {was[0]}x{was[1]})" if was else ""
                 if "frames" in info:
                     detail = f"{width}x{height}, {info['frames']} frames in {clock(info['seconds'])}"
+                    # How much of the sphere the surround reached, when it was
+                    # asked for.  Worth a word in the row: a clip that panned has
+                    # far more of its own scene to give than one that sat still,
+                    # and this is the only place that difference shows.
+                    if info.get("surround"):
+                        detail += f", {info['surround']:.0%} of the sphere filled"
                 else:
                     detail = f"{width}x{height} in {info['seconds']:.1f}s" + (" (resized)" if was else "")
                 self._set_row(index, "done", detail)
@@ -956,9 +1088,28 @@ class App:
                     self.status.config(text="Stopped")
                 self.cancel.clear()
                 self._refresh_controls()
-                if self.errors:
-                    messagebox.showerror("StereoCraft", "\n".join(self.errors))
+                self._report(self.errors, self.notices)
         self.root.after(100, self._drain)
+
+    @staticmethod
+    def _report(errors, notices):
+        """What a finished run has to say for itself.
+
+        Warnings share the dialog with failures rather than getting one of their
+        own: a run that quietly did less than it was asked to is the thing this
+        is here to stop, and two dialogs in a row is how people learn to dismiss
+        the first without reading it.
+        """
+        if not errors and not notices:
+            return
+        lines = list(errors)
+        if notices:
+            if lines:
+                lines.append("")
+            lines.append("Also worth knowing:")
+            lines += [f"  - {note}" for note in notices]
+        show = messagebox.showerror if errors else messagebox.showinfo
+        show("StereoCraft", "\n".join(lines))
 
     def _oversize_dialog(self, oversize):
         """The modal question itself, on the main thread where Tk wants it."""
@@ -995,6 +1146,7 @@ class App:
 
 
 def main():
+    logbook.start()
     if tk is None:
         print("The desktop window needs Tkinter, which this Python was built without.\n"
               "On Debian/Ubuntu: sudo apt install python3-tk", file=sys.stderr)

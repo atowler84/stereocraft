@@ -26,8 +26,21 @@ param(
     [string]$Work = "$env:USERPROFILE\StereoCraft-build",
     # da3 measures depth in metres and is what the app uses by default; the da2
     # models only rank it, and ride along as a fallback.
-    [ValidateSet("da3", "da2-small", "da2-base", "da2-large")]
-    [string[]]$Models = @("da3"),
+    # realbasicvsr is the super-resolution pass VR180 uses on a clip too small
+    # to fill the frame; 210 MB, and the app simply does not offer the option
+    # without it rather than reaching for the network.
+    # lama paints the edge of the surround, for the clip whose lens never reached
+    # the rest of the sphere; 200 MB, and without it that pass still runs and
+    # simply stops at what the clip itself saw.
+    # lama, sdxl and flux belong to `outpaint`, which is off by default and is
+    # not shipped with weights: it was measured against the footage it was built
+    # for and did not earn its 13 GB -- see the note at the top of `outpaint`.
+    # They stay selectable so the experiment can be picked up again without
+    # editing this file, and out of the default so the build stays around 6 GB
+    # rather than 20.
+    [ValidateSet("da3", "da2-small", "da2-base", "da2-large", "realbasicvsr", "rife",
+                 "lama", "sdxl", "flux")]
+    [string[]]$Models = @("da3", "realbasicvsr", "rife"),
     # Video needs ffmpeg.  It is fetched and laid beside the exe unless told not
     # to, in which case a copy has to be on the machine the app runs on.
     [switch]$SkipFfmpeg,
@@ -140,7 +153,9 @@ if (-not $SkipFfmpeg) {
 # --- weights ---------------------------------------------------------------
 $weights = Join-Path $Work "models"
 foreach ($model in $Models) {
-    if (-not (Test-Path (Join-Path $weights "$model\config.json"))) {
+    # A repository lands as a folder with a config in it; a single checkpoint
+    # lands as one file.  Either way an empty folder means it was never fetched.
+    if (-not (Get-ChildItem (Join-Path $weights $model) -File -ErrorAction SilentlyContinue)) {
         Invoke-Tool $vpy (@((Join-Path $stage "packaging\windows\fetch_models.py")) + $Models + @("-o", $weights))
         break
     }

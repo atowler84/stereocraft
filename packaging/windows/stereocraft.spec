@@ -17,6 +17,10 @@ hiddenimports = [
     "stereocraft.cli",
     "stereocraft.gui",
     "stereocraft.video",
+    # Named here as well as imported, because `launcher` opens the log before it
+    # imports either half of the app -- and this is the build whose only account
+    # of a crash is that file.
+    "stereocraft.logbook",
     # transformers reaches its model classes by name through the auto mappings,
     # so there is no import statement for the analysis to follow to them.
     "transformers.models.depth_anything.configuration_depth_anything",
@@ -52,6 +56,14 @@ datas += [(ICON, "stereocraft")]
 
 # HEIC support is a compiled library that nothing imports by name.
 binaries = collect_dynamic_libs("pillow_heif")
+# OpenCV was a dependency long before anything imported it -- DA3 wants it and
+# the app never called it -- and `plate` is the first module that actually does.
+# Its extension module carries compiled libraries of its own that PyInstaller
+# does not always find by following the import, and the failure only appears
+# after the freeze: the source tree runs perfectly and the exe cannot register a
+# single frame.
+binaries += collect_dynamic_libs("cv2")
+hiddenimports += ["cv2"]
 
 # ffmpeg is deliberately not bundled here.  PyInstaller puts everything it
 # collects under _internal, and `video._tool` looks beside the exe -- where a

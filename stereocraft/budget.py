@@ -113,21 +113,32 @@ def depth_cost(estimator, width, height, size="auto", device=None):
     return per_pixel * pixels * dtype_for(device or estimator.device).itemsize
 
 
-def needs(estimator, width, height, size="auto", device=None):
+def needs(estimator, width, height, size="auto", device=None, frame=None):
     """Bytes a conversion of this photo is expected to want at its peak.
 
     The two stages run one after the other and the first has let go before the
     second starts, so the larger of the two is what has to fit.
+
+    `frame` is the pixel count of the finished frame, for a conversion where
+    that is not simply the source's.  The vr180 projection is the one that is
+    not: it spreads a small clip across a whole hemisphere, so a 640x480 source
+    can come out 8192x4096 -- sixty times the area, and priced on the source
+    alone the check passes and the render then runs out of memory partway
+    through, which reads as a conversion that is inexplicably slow rather than
+    as one that was too big.
     """
-    return max(depth_cost(estimator, width, height, size, device), width * height * BYTES_PER_PIXEL)
+    full = (frame if frame else width * height) * BYTES_PER_PIXEL
+    return max(depth_cost(estimator, width, height, size, device), full)
 
 
-def fits(estimator, width, height, size="auto", device=None):
+def fits(estimator, width, height, size="auto", device=None, frame=None):
     """Is there room for this photo?  True when we cannot tell, so an unfamiliar
     machine behaves as it always did and finds out by trying."""
     device = device or estimator.device
     free = free_bytes(device)
-    return True if free is None else needs(estimator, width, height, size, device) <= free * HEADROOM
+    if free is None:
+        return True
+    return needs(estimator, width, height, size, device, frame) <= free * HEADROOM
 
 
 def smaller_model(estimator, width, height, size="auto", device=None):
@@ -152,7 +163,7 @@ def smaller_model(estimator, width, height, size="auto", device=None):
     return next((name for name in lighter if ACTIVATIONS[name] * cost < room), None)
 
 
-def plan(estimator, width, height, size="auto", device=None):
+def plan(estimator, width, height, size="auto", device=None, frame=None):
     """Largest size with this photo's shape that is expected to fit.
 
     Returns `(width, height)`, or None when no resize would help -- the depth
@@ -166,6 +177,9 @@ def plan(estimator, width, height, size="auto", device=None):
     budget = free * HEADROOM
     if budget <= depth_cost(estimator, width, height, size, device):
         return None
-    scale = min(1.0, (budget / BYTES_PER_PIXEL) / (width * height)) ** 0.5
+    # Scaled against whichever is larger, so a projection that grows the frame
+    # is shrunk by what it will actually cost rather than by what it came in as.
+    area = max(width * height, frame or 0)
+    scale = min(1.0, (budget / BYTES_PER_PIXEL) / area) ** 0.5
     target = (max(1, int(width * scale)), max(1, int(height * scale)))
     return None if target == (width, height) else target

@@ -32,9 +32,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import budget, spherical, stereo, vr180
+from . import budget, logbook, spherical, stereo, vr180
 from .depth import DEFAULT_FOCAL_35MM, _app_dir, focal_from_35mm
-from .pipeline import OUT_OF_MEMORY, Converter, VideoSettings, tag
+from .pipeline import OUT_OF_MEMORY, Converter, VideoSettings, notice, tag
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mts", ".m2ts", ".wmv", ".flv"}
 # A child of a windowed Windows app is given a console window of its own, so
@@ -69,6 +69,10 @@ ENCODERS = {
 # picture cut rather than moved.  Relative because metres have no fixed scale --
 # an ordinary pan sits far below this at any distance.
 SCENE_CUT = 0.35
+# Frames between memory lines in the log.  Often enough that a climb is visible
+# in the trail a killed process leaves behind, rare enough that an hour of
+# conversion is a page rather than a book.
+HEARTBEAT = 200
 
 
 class MissingFFmpeg(Exception):
@@ -93,6 +97,40 @@ def available_encoders():
         _ENCODERS_SEEN = {line.split()[1] for line in result.stdout.splitlines()
                           if line.startswith(" ") and len(line.split()) > 1}
     return _ENCODERS_SEEN
+
+
+# Where h264 stops being the safe answer.  Not its own level limit -- 6.x goes
+# to 8192 -- but what a headset will actually decode: 4K for h264, 8K only on
+# h265 and AV1.  A VR180 frame is 8192 across and a full-width flat pair off a
+# 4K source is 7448, so the frame is what decides this rather than the
+# projection, which was the first thing tried and missed the second case.
+H264_CEILING = 4096
+# And where the encoder's own frame-parallelism stops being affordable.  x264 and
+# x265 both keep several frames in flight at once -- a lookahead queue, the
+# reference list, and one working copy per frame thread -- so their memory is a
+# multiple of the frame rather than the frame.  At 8192 square a yuv420p frame is
+# 100 MB before any analysis buffer, and the default parallelism on a many-core
+# machine asks for tens of gigabytes of it.
+#
+# Slice threading is the way out and costs almost nothing at this size: it splits
+# one frame across the cores instead of running several frames at once, and a
+# frame 8192 tall is 128 CTU rows, which is more parallelism than any desktop has
+# threads.  The compression loss that makes slice threading a bad default at
+# 1080p is therefore not being paid here either.
+THREAD_CEILING = 4096 * 4096
+
+
+def codec_for(width, asked="auto"):
+    """The codec to write a frame this wide with.
+
+    `auto` is not a preference for hevc.  h264 plays on more than anything else
+    does and CRF does not mean the same number in the two encoders -- 18 in x265
+    is nearer 22 in x264 -- so switching quietly changes what a quality setting
+    asks for.  It switches where h264 would simply not play.
+    """
+    if asked and asked != "auto":
+        return asked
+    return "hevc" if width > H264_CEILING else "h264"
 
 
 def pick_encoder(codec):
@@ -292,10 +330,14 @@ def geometry(clip, settings):
     have -- the same assumption `depth` falls back on for a photo that has lost
     its EXIF, and the only one available here, since no clip carries intrinsics
     and the metric model reports none.
+
+    How big it can be comes from the frame rate, a hardware decoder being
+    limited by pixels per second rather than by pixels -- see `vr180.video_cap`.
     """
     if settings.projection == "vr180":
         assumed = focal_from_35mm(DEFAULT_FOCAL_35MM, clip.width)
-        spot = vr180.patch(assumed, clip.width, clip.height, settings.vr180_cap,
+        cap = settings.vr180_cap or vr180.video_cap(clip.fps)
+        spot = vr180.patch(assumed, clip.width, clip.height, cap,
                            None if settings.vr180_size in (None, 0, "auto")
                            else int(settings.vr180_size))
         return Geometry(margin=0, eye=spot.width, height=spot.height, patch=spot)
@@ -304,7 +346,7 @@ def geometry(clip, settings):
     return Geometry(margin=margin, eye=_even(eye), height=_even(clip.height))
 
 
-def output_path(src, dst=None, name="_sbs"):
+def output_path(src, dst=None, name="_full_sbs"):
     src = Path(src)
     if dst is None:
         return src.with_name(f"{src.stem}{name}.mp4")
@@ -345,38 +387,96 @@ def _decoder(src, clip, size, stderr):
                             **NO_CONSOLE)
 
 
-def _encoder(out, src, clip, geo, cfg, stderr):
-    """ffmpeg taking finished frames on stdin, with the original soundtrack
-    alongside them straight off the source file."""
+def wants_sound(clip, cfg):
+    """Whether this conversion should carry the original soundtrack."""
+    return bool(cfg.audio and clip.audio)
+
+
+def _audio_args(clip):
+    """Copied when the container will take it as it is, so the soundtrack goes
+    through untouched; re-encoded only when it would otherwise be refused."""
+    return (["-c:a", "copy"] if clip.audio in COPYABLE_AUDIO
+            else ["-c:a", "aac", "-b:a", "192k"])
+
+
+def _encoder(out, clip, geo, cfg, stderr, faststart=True):
+    """ffmpeg taking finished frames on stdin, and writing the picture alone.
+
+    **The soundtrack used to be muxed in right here, and that was the leak.**
+    The old command gave ffmpeg two inputs: this pipe, and the source file for
+    its audio.  They arrive at wildly different speeds -- a frame comes down the
+    pipe once the depth model and an 8K render have finished with it, which is
+    the better part of a second, while the source file reads at disk speed -- and
+    a muxer cannot write an audio packet until the video packet it interleaves
+    with has turned up.  So ffmpeg reads the soundtrack far ahead and holds it,
+    and what it holds is proportional to how long the clip is.  An hour of
+    audio is tens of thousands of packets sitting in the muxing queue behind a
+    picture that is still on frame 200.
+
+    That is why this failed on long clips and not on short ones, and why the
+    error came from ffmpeg rather than from us.  The picture is written on its
+    own here and `_remux` puts the sound back afterwards, where both sides are
+    files and neither has to wait for the other.
+
+    `faststart` is left to whichever pass writes the finished file: doing it here
+    as well would rewrite a very large file twice for no gain.
+    """
     args = [_tool("ffmpeg"), "-v", "error", "-y", "-nostdin",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{geo.width}x{geo.height}", "-r", f"{clip.fps}", "-i", "-"]
-    sound = bool(cfg.audio and clip.audio)
-    if sound:
-        # No -shortest here.  It looks like the safe option and is not: an AAC
-        # track carries a little encoder priming, which makes ffmpeg reckon it
-        # the shorter stream and truncate the picture to match.  On a 90-frame
-        # clip that quietly cost three frames off the end.  Every frame rendered
-        # is a frame worth keeping; a fractionally long soundtrack is harmless.
-        args += ["-i", str(src), "-map", "0:v:0", "-map", "1:a:0"]
-    encoder, quality, extra = pick_encoder(cfg.codec)
-    if encoder != ENCODERS[cfg.codec][0][0]:
+    codec = codec_for(geo.width, cfg.codec)
+    encoder, quality, extra = pick_encoder(codec)
+    if encoder != ENCODERS[codec][0][0]:
         # Worth a word.  The preferred encoder is the best of them at a given
         # size, and falling past it is invisible in the finished file unless
         # someone thinks to ask ffprobe -- so a clip that came out softer than
         # the last one would look like the app's fault rather than the ffmpeg's.
-        print(f"{Path(out).name}: encoding with {encoder}; this ffmpeg has no "
-              f"{ENCODERS[cfg.codec][0][0]}", file=sys.stderr)
-    args += ["-c:v", encoder, quality, str(cfg.crf), *extra,
-             "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
-    if sound:
-        # Copied when the container will take it as it is, so the soundtrack goes
-        # through untouched; re-encoded only when it would otherwise be refused.
-        args += (["-c:a", "copy"] if clip.audio in COPYABLE_AUDIO
-                 else ["-c:a", "aac", "-b:a", "192k"])
+        notice(cfg, f"{Path(out).name}: encoding with {encoder}; this ffmpeg has no "
+                    f"{ENCODERS[codec][0][0]}")
+    args += ["-c:v", encoder, quality, str(cfg.crf), *extra, "-pix_fmt", "yuv420p"]
+    args += _thrift(encoder, geo.width, geo.height)
+    if faststart:
+        args += ["-movflags", "+faststart"]
     args.append(str(out))
     return subprocess.Popen(args, stdin=subprocess.PIPE, stderr=stderr, bufsize=0,
                             **NO_CONSOLE)
+
+
+def _thrift(encoder, width, height):
+    """Encoder settings that trade frame parallelism for memory, above
+    `THREAD_CEILING`.  Nothing at all below it, where the defaults are right."""
+    if width * height <= THREAD_CEILING:
+        return []
+    if encoder == "libx265":
+        # Frame threads are what multiply the memory; WPP, which is on by
+        # default, keeps the cores busy inside the one frame instead.  The
+        # lookahead is halved for the same reason -- every frame in it is another
+        # 100 MB held.
+        return ["-x265-params", "frame-threads=1:rc-lookahead=10"]
+    if encoder == "libx264":
+        return ["-x264-params", "sliced-threads=1"]
+    return []
+
+
+def _remux(picture, src, out, clip, cfg, stderr):
+    """Put the soundtrack back and move the index to the front, in one pass.
+
+    Both inputs are files, so neither waits on the other and nothing is buffered
+    to speak of -- which is the whole point of doing it here rather than during
+    the encode.  The picture is copied rather than re-encoded, so this runs at
+    the speed of the disk.
+
+    No -shortest.  It looks like the safe option and is not: an AAC track carries
+    a little encoder priming, which makes ffmpeg reckon it the shorter stream and
+    truncate the picture to match.  On a 90-frame clip that quietly cost three
+    frames off the end.  Every frame rendered is a frame worth keeping; a
+    fractionally long soundtrack is harmless.
+    """
+    args = [_tool("ffmpeg"), "-v", "error", "-y", "-nostdin",
+            "-i", str(picture), "-i", str(src),
+            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+            *_audio_args(clip), "-movflags", "+faststart", str(out)]
+    return subprocess.run(args, stderr=stderr, **NO_CONSOLE).returncode
 
 
 def _decode_size(converter, src, clip):
@@ -389,7 +489,12 @@ def _decode_size(converter, src, clip):
     """
     cfg = converter.settings
     estimator = converter.depth_model
-    if budget.fits(estimator, clip.width, clip.height, cfg.depth_size):
+    # A vr180 clip is priced on the frame it comes out as rather than the one it
+    # went in as: the projection spreads it across a hemisphere, and a 640x480
+    # source priced on itself passes this check and runs out of memory later.
+    geo = geometry(clip, cfg)
+    frame = geo.width * geo.height if cfg.projection == "vr180" else None
+    if budget.fits(estimator, clip.width, clip.height, cfg.depth_size, frame=frame):
         return None
     oversize = converter._proposal(src, (clip.width, clip.height), [estimator.device])
     if converter._decide(oversize) != "resize" or oversize.target is None:
@@ -406,7 +511,8 @@ def _fall_back_to_cpu(converter):
     """
     if converter.depth_model.device.type == "cpu":
         return False
-    print("out of video memory part-way through; carrying on with the CPU", file=sys.stderr)
+    notice(converter.settings,
+           "out of video memory part-way through; carrying on with the CPU")
     converter.settings.device = "cpu"
     converter._depth = None
     torch.cuda.empty_cache()
@@ -425,13 +531,18 @@ def _squeeze(eye, width, height):
                          align_corners=False, antialias=True)[0]
 
 
-def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None, **kwargs):
+def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None,
+                  on_stage=None, **kwargs):
     """Convert one clip into a side-by-side 3D one.
 
     `converter` keeps the depth model loaded across several clips; without one,
     `kwargs` are `VideoSettings` fields for a single conversion.  `on_progress`
     is called with `(frames done, frames expected, seconds so far)` and returning
-    False from it cancels, leaving no half-written file behind.  `on_frame` is
+    False from it cancels, leaving no half-written file behind.  `on_stage` is
+    called `(label, done, expected)` through the passes that run before the
+    conversion -- each of which takes minutes -- and cancels the same way; a
+    caller that does not take it sees nothing until the conversion itself
+    starts, which is a long time to look at a still bar.  `on_frame` is
     handed each finished frame as it goes by, for showing the work in progress;
     it costs nothing, the array having had to be made for the encoder anyway.
 
@@ -448,7 +559,22 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
     clip = probe(src)
     source = (clip.width, clip.height)
 
-    size = _decode_size(converter, src, clip)
+    # Enhanced first and separately, because the models that do it will not fit
+    # on a card beside the depth model and an 8K render -- see `prepass`.  What
+    # comes back describes the intermediate, so everything below sizes itself to
+    # what it will actually read; `src` stays the original, for the output name.
+    # Imported here rather than at the top: `prepass` reaches back into this
+    # module for the decoder and encoder plumbing, and the two would deadlock.
+    from . import prepass
+
+    with logbook.stage("prepass", clip=src.name, frames=clip.frames):
+        enhanced, clip = prepass.run(src, clip, cfg, on_progress=on_stage,
+                                     work=(dst if dst and Path(dst).is_dir() else None))
+    if enhanced is False:  # stopped part-way through a pass, and cleaned up after itself
+        return None
+    reading = enhanced or src
+
+    size = _decode_size(converter, reading, clip)
     if size is False:  # too big, and the answer was to leave it alone
         return None
     if size is not None:
@@ -462,14 +588,49 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
         each = 5.4 * work[0] * work[1] / 1e6
         total = each * (clip.frames or 1)
         if total > 600:
-            print(f"{src.name}: this is a CPU conversion -- about {each:.0f}s a frame, so "
-                  f"{clock(total)} for {clip.frames} frames. A graphics card does it in "
-                  f"minutes, and --model da2-small is the quickest way through without one.",
-                  file=sys.stderr)
+            notice(cfg, f"{src.name}: this is a CPU conversion -- about {each:.0f}s a frame, "
+                        f"so {clock(total)} for {clip.frames} frames. A graphics card does it "
+                        f"in minutes, and the da2-small depth model is the quickest way "
+                        f"through without one.")
 
     geo = geometry(clip, cfg)
+
+    # The scene around the picture, gathered once per shot before a single frame
+    # is rendered -- which is the whole reason it cannot boil.  Cheap next to the
+    # two passes above it: one decode at a fraction of the width, and no encode.
+    from . import plate as plates_module
+
+    plates = None
+    if plates_module.wanted(clip, cfg):
+        try:
+            with logbook.stage("surround", clip=src.name, frames=clip.frames):
+                plates = plates_module.build(reading, clip, cfg, on_progress=on_stage,
+                                             device=converter.depth_model.device,
+                                             estimator=converter.depth_model)
+        except Exception as problem:
+            # A surround that could not be built is a smaller picture, not a
+            # failed one; the wash is still there behind it.
+            notice(cfg, f"{src.name}: could not look around the clip, so the surround is "
+                        f"the usual blur: {plates_module._reason(problem)}")
+        if plates is False:  # stopped while looking around
+            if enhanced:
+                enhanced.unlink(missing_ok=True)
+            return None
+        if plates is not None:
+            plates = plates.to(converter.depth_model.device)
+
     out = output_path(src, dst, tag(cfg))
     out.parent.mkdir(parents=True, exist_ok=True)
+    # The picture is written on its own first whenever there is a soundtrack to
+    # add, and `_remux` makes `out` from it; see `_encoder` for why the two
+    # cannot be one pass.  With no sound there is nothing to add and the encoder
+    # writes the finished file directly.
+    sound = wants_sound(clip, cfg)
+    picture = out.with_name(f"{out.stem}.picture{out.suffix}") if sound else out
+    logbook.note("clip", name=src.name, size=f"{clip.width}x{clip.height}",
+                 frames=clip.frames, fps=round(clip.fps, 3),
+                 out=f"{geo.width}x{geo.height}", codec=codec_for(geo.width, cfg.codec),
+                 sound=sound, shots=(len(plates.shots) if plates is not None else 0))
     normalizer = TemporalDepth(cfg.temporal)
 
     frame_bytes = clip.width * clip.height * 3
@@ -489,19 +650,24 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
     requested = cfg.device
     try:
         with tempfile.TemporaryFile() as decode_log, tempfile.TemporaryFile() as encode_log:
-            decoder = _decoder(src, clip, size, decode_log)
-            encoder = _encoder(out, src, clip, geo, cfg, encode_log)
+            decoder = _decoder(reading, clip, size, decode_log)
+            encoder = _encoder(picture, clip, geo, cfg, encode_log,
+                               faststart=picture == out)
             try:
                 while _read_exactly(decoder.stdout, view) == frame_bytes:
+                    backdrop = plates.at(done, square) if plates is not None else None
                     try:
                         left, right, _ = converter.render(frame, normalizer, geo.margin,
-                                                          spot=square)
+                                                          spot=square, plate=backdrop)
                     except OUT_OF_MEMORY:
                         if not _fall_back_to_cpu(converter):
                             raise
                         normalizer.reset()  # its memory is on a device we have just left
+                        if plates is not None:  # and so is the plate's
+                            plates = plates.to(converter.depth_model.device)
+                            backdrop = plates.at(done, square)
                         left, right, _ = converter.render(frame, normalizer, geo.margin,
-                                                          spot=square)
+                                                          spot=square, plate=backdrop)
 
                     left = _squeeze(left, geo.eye, geo.height)
                     right = _squeeze(right, geo.eye, geo.height)
@@ -513,6 +679,12 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
                         on_frame(pixels)
 
                     done += 1
+                    if done % HEARTBEAT == 0:
+                        current, peak = logbook.memory()
+                        card = logbook.cuda_memory()
+                        logbook.note("rendering", frame=done, of=clip.frames,
+                                     rss=logbook._gb(current), peak=logbook._gb(peak),
+                                     **({"cuda": logbook._gb(card[0])} if card else {}))
                     if on_progress and on_progress(done, clip.frames, time.perf_counter() - started) is False:
                         cancelled = True
                         break
@@ -520,16 +692,16 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
                 # The encoder died, and its own complaint is more use than the broken
                 # pipe that is all this end saw of it.
                 _stop(decoder, encoder)
-                out.unlink(missing_ok=True)
+                _discard(out, picture)
                 raise RuntimeError(f"ffmpeg could not encode {out.name}: {_log(encode_log)}") from None
             except BaseException:  # Ctrl-C, out of memory, a frame that would not render
                 _stop(decoder, encoder)
-                out.unlink(missing_ok=True)
+                _discard(out, picture)
                 raise
 
             if cancelled:
                 _stop(decoder, encoder)
-                out.unlink(missing_ok=True)
+                _discard(out, picture)
                 return None
 
             decoder.stdout.close()
@@ -537,10 +709,23 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
             decoder.wait()
             encoder.wait()
             if not done:
-                out.unlink(missing_ok=True)
+                _discard(out, picture)
                 raise RuntimeError(f"no frames came out of {src.name}: {_log(decode_log)}")
             if encoder.returncode:
+                _discard(out, picture)
                 raise RuntimeError(f"ffmpeg could not write {out.name}: {_log(encode_log)}")
+
+            if sound:
+                with tempfile.TemporaryFile() as mux_log:
+                    if _remux(picture, src, out, clip, cfg, mux_log):
+                        # The picture is finished and only the soundtrack failed,
+                        # so the clip is worth keeping without it -- the whole
+                        # conversion is in that file, and it is hours of it.
+                        notice(cfg, f"{out.name}: the soundtrack could not be carried "
+                                    f"over, so the clip is silent: {_log(mux_log)}")
+                        picture.replace(out)
+                    else:
+                        picture.unlink(missing_ok=True)
 
         # Said last, into the finished file, because ffmpeg will not say it at
         # all.  A failure here is worth a word rather than an exception: the clip
@@ -551,10 +736,14 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
                 out, geo.patch,
                 spherical.RIGHT_LEFT if cfg.cross_eyed else spherical.LEFT_RIGHT)
             if not marked:
-                print(f"{out.name}: could not write the projection boxes; the clip is "
-                      f"fine but a player will have to be told what it is", file=sys.stderr)
+                notice(cfg, f"{out.name}: could not write the projection boxes; the clip is "
+                            f"fine but a player will have to be told what it is")
 
         seconds = time.perf_counter() - started
+        current, peak = logbook.memory()
+        logbook.note("converted", name=out.name, frames=done, cuts=normalizer.cuts,
+                     took=f"{seconds:.1f}s", rss=logbook._gb(current),
+                     peak=logbook._gb(peak))
         return {
             "input": src,
             "output": out,
@@ -566,6 +755,8 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
             "coverage": converter.covered,
             "lens": converter.lens,
             "patch": geo.patch,
+            "enhanced": (clip.width, clip.height, clip.fps) if enhanced else None,
+            "surround": None if plates is None else vr180.coverage(plates.reach(square), square),
             "marked": marked if geo.patch is not None else None,
             "fps": clip.fps,
             "seconds": seconds,
@@ -573,6 +764,10 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
     finally:
         if converter.settings.device != requested:
             converter.settings.device, converter._depth = requested, None
+        if enhanced:  # False when a pass was stopped, and it tidied up itself
+            enhanced.unlink(missing_ok=True)
+        if picture != out:  # only ever still here if something went wrong late
+            picture.unlink(missing_ok=True)
 
 
 def _stop(*processes):
@@ -591,8 +786,25 @@ def _stop(*processes):
                 process.kill()
 
 
-def _log(handle):
-    """The last thing ffmpeg said, which is the part worth repeating."""
+def _discard(out, picture):
+    """Throw away a conversion, whichever of the two files it had got to."""
+    for path in {out, picture}:
+        path.unlink(missing_ok=True)
+
+
+def _log(handle, lines=3):
+    """What ffmpeg said: the tail for the message, the whole of it for the log.
+
+    This used to return the last line alone.  That is the right length for an
+    error someone reads in a dialog and the wrong length for one they have to
+    diagnose -- an encoder running out of memory says so over several lines, and
+    the last of them is the least informative.  So the tail is what is shown and
+    the rest goes to `logbook`, where it is still there afterwards.
+    """
     handle.seek(0)
     text = handle.read().decode("utf-8", "replace").strip()
-    return text.splitlines()[-1] if text else "no reason given"
+    if not text:
+        return "no reason given"
+    logbook.note("ffmpeg said", lines=len(text.splitlines()))
+    logbook.log.debug("ffmpeg output:\n%s", text)
+    return " / ".join(text.splitlines()[-lines:])

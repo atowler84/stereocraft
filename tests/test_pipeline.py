@@ -129,7 +129,7 @@ class TestVr180:
         coverage figure counts what the camera saw, not what was painted in."""
         plain = self.convert(converter, photo, tmp_path / "a.jpg", vr180_size=192)
         washed = self.convert(converter, photo, tmp_path / "b.jpg", vr180_size=192,
-                              vr180_surround=True)
+                              vr180_surround=0.45)
         lit = lambda p: (np.asarray(Image.open(p)).max(axis=2) > 8).mean()
         assert lit(plain["output"]) < 0.35
         assert lit(washed["output"]) > 0.9
@@ -140,7 +140,7 @@ class TestVr180:
         where the viewer's eyes converge, and there is no true disparity to give
         it -- nothing was ever there to have one."""
         info = self.convert(converter, photo, tmp_path / "vr.jpg", vr180_size=192,
-                            vr180_surround=True, fmt="png")
+                            vr180_surround=0.45, fmt="png")
         out = np.asarray(Image.open(info["output"])).astype(int)
         left, right = out[:, :192], out[:, 192:]
         corner = (slice(0, 24), slice(0, 24))  # a pole, which no lens ever reaches
@@ -157,10 +157,16 @@ class TestVr180:
         info = self.convert(converter, photo, tmp_path / "vr.jpg", vr180_size=128)
         assert info["lens"] == "assumed", "the fixture photo carries no EXIF"
 
-    def test_auto_sizing_asks_for_the_photo_s_own_detail(self, converter, photo, tmp_path):
-        """320 pixels across a phone's 65 degrees wants about 880 across 180."""
+    def test_auto_sizing_gives_the_ceiling_not_the_photo_s_own_size(
+            self, converter, photo, tmp_path):
+        """A headset shows 25 pixels a degree whatever it is handed, so a small
+        photo gets the same frame a large one does.  What the photo could
+        actually fill is `vr180.natural_size`, and the gap is what the upscaler
+        exists to close."""
+        from stereocraft import vr180
         info = self.convert(converter, photo, tmp_path / "vr.jpg")
-        assert info["patch"].width == pytest.approx(320 * 180 / 65.47, abs=2)
+        assert info["patch"].width == Settings.vr180_cap
+        assert vr180.natural_size(320, 320 * 28 / 36) < info["patch"].width, "and it is short"
 
 
 class TestVideo:

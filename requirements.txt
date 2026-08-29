@@ -14,7 +14,6 @@
 # it, which keeps the whole distribution permissively licensed.
 torch>=2.1
 torchvision
-transformers>=4.41
 einops
 addict
 omegaconf
@@ -24,3 +23,13 @@ opencv-python
 pillow>=10.0
 pillow-heif>=0.16
 numpy>=1.24,<2
+
+# transformers and huggingface_hub are a pair, and the pin is load-bearing.
+# transformers 4.57 declares hub <1.0 and refuses to import above it, so a tree
+# that ends up with 4.57 and hub 1.x has a working `da3` and a *broken* `da2-*`
+# -- the fallback models import transformers and the older one will not have it.
+# That was true here before anything was pinned, and is the kind of breakage that
+# only shows up when someone reaches for the fallback.  The modern pair works for
+# both, checked by converting a photo with each.
+transformers>=5.0
+huggingface_hub>=1.0

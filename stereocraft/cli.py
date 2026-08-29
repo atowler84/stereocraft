@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 
 from . import __version__
+from . import logbook
+from . import vr180
 from .pipeline import SBS_TAGS, SUFFIXES, Converter, Settings, VideoSettings
 from .video import VIDEO_SUFFIXES, clock, convert_video
 
@@ -119,13 +121,21 @@ def build_parser():
                              "and dark where it does not, which is most of it")
     parser.add_argument("--vr180-size", type=int, default=None, metavar="PX",
                         help="stored width per eye for --projection vr180, each eye being a "
-                             "square 180 degrees across. (default: as much of the source's own "
-                             "detail as fits, capped at 4096 for a photo and 2048 for a clip)")
-    parser.add_argument("--vr180-surround", action="store_true",
-                        help="fill the part of the sphere the picture never reached with a dim, "
+                             "square 180 degrees across. (default: 4096 for a photo, and for a "
+                             "clip whatever its frame rate leaves the decoder -- 4096 up to "
+                             "60fps, 3344 at 90, 2896 at 120)")
+    # A value rather than an optional one: argparse lets a bare flag with an
+    # optional value eat the filename after it, and "--vr180-surround photo.jpg"
+    # is exactly how someone would type it.
+    parser.add_argument("--vr180-surround", type=float, default=0.0, metavar="BRIGHTNESS",
+                        help="fill the part of the sphere the picture never reached with a "
                              "blurred spread of the picture rather than leaving it black -- what "
                              "a social video site puts behind a clip that does not fill the "
-                             "frame. A fixed function of each frame, so a clip cannot crawl")
+                             "frame. A fixed function of each frame, so a clip cannot crawl. "
+                             f"0 is off, {vr180.SURROUND_DIM} is a good starting point, 1.0 is "
+                             "the picture's own light undimmed, and above that it is screened "
+                             "into itself to light a dark scene -- reaching for white without "
+                             "ever flattening into it")
     parser.add_argument("--cross", action="store_true", help="write right|left for cross-eyed viewing")
     parser.add_argument("--max-size", type=int, default=0, help="cap the output width, 0 for native")
     parser.add_argument("--format", choices=("auto", "jpg", "png"), default="auto", dest="fmt")
@@ -142,13 +152,64 @@ def build_parser():
     video.add_argument("--temporal", type=float, default=0.5, metavar="KEEP",
                        help="how much of the previous frame's depth to carry over, 0 to 0.95. "
                             "Steadies a clip that shimmers, at a little edge sharpness; 0 is off")
+    video.add_argument("--upscale", action="store_true",
+                       help="put real detail into a clip too small to fill the frame, with a "
+                            "temporal super-resolution pass before converting. Only acts when "
+                            "the source is short of the ceiling, so it costs nothing on footage "
+                            "that already fills it")
+    video.add_argument("--upscale-detail", type=float, default=None, metavar="KEEP",
+                       help="how much of the upscaler's own picture to keep against a plain "
+                            "enlargement of the source, 0 to 1. Lower it when a clip comes back "
+                            "looking painted rather than filmed; 0 adds no detail at all")
+    # Kept, and hidden.  No weights are shipped for this and it did not earn any
+    # -- see the note at the top of `outpaint` -- so it is not offered in `--help`
+    # any more than it is offered in the window.  It still works if the weights
+    # are put where it looks, which is what makes the experiment repeatable.
+    video.add_argument("--outpaint", action="store_true", help=argparse.SUPPRESS)
+    video.add_argument("--outpaint-reach", type=float, default=None, metavar="DEG",
+                       help=argparse.SUPPRESS)
+    video.add_argument("--outpaint-model", default="auto",
+                       choices=["auto", "flux", "sdxl", "lama"], help=argparse.SUPPRESS)
+    video.add_argument("--interpolate", action="store_true",
+                       help="raise a clip below 59fps to 60 before converting, motion "
+                            "compensated. 60 rather than more because the decode ceiling falls "
+                            "as frame rate rises, and 60 is the fastest that still writes at "
+                            "full angular resolution")
     video.add_argument("--crf", type=int, default=18, help="encoder quality, lower is better")
-    video.add_argument("--codec", choices=("h264", "hevc"), default="h264",
-                       help="hevc is worth it above 4K, where h264 runs out of level")
+    video.add_argument("--codec", choices=("auto", "h264", "hevc"), default="auto",
+                       help="auto writes h264 where a headset will decode it and hevc where it "
+                            "will not, which is past 4096 across -- every vr180 frame, and a "
+                            "full-width flat pair off a 4K source. Not a preference for hevc: "
+                            "h264 plays on more, and CRF does not mean the same number in the "
+                            "two encoders")
     video.add_argument("--no-audio", action="store_true", help="leave the soundtrack behind")
     parser.add_argument("--gui", action="store_true", help="open the desktop window instead")
     parser.add_argument("-V", "--version", action="version", version=f"StereoCraft {__version__}")
     return parser
+
+
+def stage_reporter(name, prefix):
+    """Progress through the passes that run before a conversion.
+
+    They take minutes each, and without this the line sits on the file name
+    saying nothing until the conversion itself starts -- which reads as a hang
+    rather than as work.
+    """
+    if not sys.stderr.isatty():
+        return None
+    last = 0.0
+
+    def report(label, done, total):
+        nonlocal last
+        now = time.monotonic()
+        if now - last < 0.5:
+            return True
+        last = now
+        share = f" {done}/{total}" if total else (f" {done}" if done else "")
+        print(f"\r{prefix}{name}  {label}{share}      ", end="", file=sys.stderr, flush=True)
+        return True
+
+    return report
 
 
 def reporter(name, prefix):
@@ -207,7 +268,13 @@ def settings_for(args, video):
     )
     if video:
         settings = VideoSettings(**common, full_width=args.full, temporal=args.temporal,
-                                 crf=args.crf, codec=args.codec, audio=not args.no_audio)
+                                 crf=args.crf, codec=args.codec, audio=not args.no_audio,
+                                 upscale=args.upscale, upscale_detail=args.upscale_detail,
+                                 interpolate=args.interpolate,
+                                 outpaint=args.outpaint,
+                                 outpaint_model=args.outpaint_model,
+                                 **({} if args.outpaint_reach is None
+                                    else {"outpaint_reach": args.outpaint_reach}))
     else:
         settings = Settings(**common, max_size=args.max_size, quality=args.quality,
                             fmt=args.fmt, save_depth=args.save_depth)
@@ -242,6 +309,7 @@ def retired(args):
 
 
 def main(argv=None):
+    logbook.start()
     args = build_parser().parse_args(argv)
     retirement = retired(args)
     if retirement:
@@ -274,7 +342,9 @@ def main(argv=None):
         converter.settings = for_videos if moving else for_photos
         try:
             if moving:
-                info = convert_video(item, args.output, converter, reporter(item.name, prefix))
+                info = convert_video(item, args.output, converter,
+                                     reporter(item.name, prefix),
+                                     on_stage=stage_reporter(item.name, prefix))
                 print("\r\033[K" if sys.stderr.isatty() else "", end="", file=sys.stderr)
             else:
                 info = converter.convert(item, args.output)
@@ -310,6 +380,12 @@ def main(argv=None):
         # the one nobody would think to ask for until they had put it on.
         if info.get("coverage") is not None:
             chose += f"  {info['coverage']:.0%} of a sphere"
+            # And how much of it the surround reached, which is a different
+            # number and the one that says whether asking for it was worth it: a
+            # clip that panned has far more of its own scene to give than one
+            # that sat still, and only this says which happened.
+            if info.get("surround"):
+                chose += f" ({info['surround']:.0%} filled)"
             if info.get("marked") is False:
                 chose += " (unlabelled)"
             # On a plane a wrong lens only rescales the scene and the focus

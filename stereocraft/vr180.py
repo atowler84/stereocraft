@@ -67,16 +67,56 @@ LIMIT_DEG = 1.2
 # How wide the fade at the edge of the real picture is.  In degrees rather than
 # pixels, because it is a fact about the sphere and not about the file.
 FALLOFF_DEG = 4.0
-# How coarse the optional surround is, and how much dimmer than the picture.
-# Coarse enough to read as light rather than as a second blurry photograph, and
-# dim because a bright periphery is tiring to sit inside and competes with the
-# thing you are meant to be looking at.
+# How coarse the optional surround is, and how bright.  Coarse enough to read as
+# light rather than as a second blurry photograph, and dim because a bright
+# periphery is tiring to sit inside and competes with the thing you are meant to
+# be looking at -- at full strength the wash measures brighter than the picture
+# it came from, the picture having dark parts and the average of it not.
 SURROUND_BLUR_DEG = 12.0
 SURROUND_DIM = 0.45
-# Ceilings on the stored width per eye.  A still can afford a big one; a clip has
-# to come back out of a hardware decoder, and 2048 per eye is 4096 across.
+# How far the wash stays at the picture's own brightness before easing to
+# `SURROUND_DIM`.
+#
+# Without this there is a cliff exactly where the eye is drawn: the picture ends
+# at full strength and the wash begins at 45% of it, which measured as a step of
+# 75 of 255 across the boundary.  Easing from one to the other over 25 degrees
+# takes that to 53, and what is left is inherent -- a wash is a blur, so it
+# cannot match a sharp pillow-against-headboard edge locally however bright it
+# is.  Widening `FALLOFF_DEG` instead was tried and does not help: it fades the
+# photograph rather than lifting the wash, so the step stays and real picture is
+# lost.
+SURROUND_RAMP_DEG = 25.0
+# How brightly the plate is shown, when there is one.  Full strength, which took
+# a measurement to arrive at and is worth writing down: at 0.7 the step across
+# the edge of the photograph measures 30% and reads as a seam, at 0.85 it is 15%,
+# and at 1.0 it is 0.4% -- invisible.
+#
+# The reason it can be 1.0 where `SURROUND_DIM` is 0.45 is that the two are not
+# the same kind of thing.  A wash is a blur of the picture, and a blur measures
+# brighter than what it came from, the picture having dark parts and the average
+# of it not; it has to be pulled down to stop it glowing.  A plate is the scene
+# itself, at the exposure `_match_gain` has just matched to this very frame, dark
+# parts and all -- so dimming it is not restraint, it is a vignette drawn round
+# real footage, and it lands exactly where the eye is already looking.  What the
+# viewer sees past the plate is still the wash, still governed by
+# `Settings.vr180_surround`, and still dim.
+PLATE_DIM = 1.0
+# And how wide the fade is where the plate runs out.  Wider than the picture's
+# own edge: that one is a join between photograph and nothing, where this is a
+# join between what was filmed and what was inferred from it, and the eye goes
+# straight to a hard circle where a painted ring stops.
+PLATE_FALLOFF_DEG = 10.0
+# Ceiling on the stored width per eye for a still, which nothing has to decode
+# in real time.
 MAX_SIZE = 4096
-VIDEO_MAX_SIZE = 2048
+# And for a clip, which does.  A hardware decoder is limited by pixels per
+# second rather than by pixels, so what a clip can afford depends on how fast it
+# runs: a Quest 3 will take 8192x4096 at 60fps, 6688x3344 at 90 and 5792x2896 at
+# 120, and each of those is two eyes side by side.  Half of each, then, and the
+# frame rate decides which.  Sitting at 2048 regardless spent half the decoder
+# on nothing: 4096 per eye is 22.8 pixels per degree against the headset's own
+# 25, where 2048 was 11.4 -- less than half what the display could have shown.
+VIDEO_CAPS = ((60.0, 4096), (90.0, 3344), (120.0, 2896))
 # Output pixels per band, so peak memory stops tracking the whole projection --
 # the same trick `stereo._render_eye` plays, for the same reason.
 _BAND_PIXELS = 8_000_000
@@ -134,17 +174,29 @@ class Patch:
         return self.width / math.radians(self.span_az)
 
 
-def per_eye(width, focal_px, cap=MAX_SIZE):
-    """The square to store each eye at.
+def video_cap(fps):
+    """The largest per-eye square a clip at this frame rate can be decoded at.
 
-    Keeping the photograph's own detail means giving the sphere the pixels per
-    degree the photograph had, which for a 65-degree lens is a square nearly
-    three times the source width and for a 49-degree one four times.  It is asked
-    for and then capped, so a big photograph is used softer than it arrived --
-    the price of a frame that needs nothing read to sit at the right size.
+    Rounded down through `VIDEO_CAPS`, and never below the slowest entry -- a
+    clip claiming some absurd frame rate gets the most conservative answer
+    rather than an exception, having to play on the same hardware as the rest.
     """
-    natural = width * FOV / fov(focal_px, width)
-    return even(max(64, min(cap, round(natural))))
+    for limit, side in VIDEO_CAPS:
+        if fps <= limit + 1e-6:
+            return side
+    return VIDEO_CAPS[-1][1]
+
+
+def natural_size(width, focal_px):
+    """The per-eye square that would keep this source's own detail exactly.
+
+    Giving the sphere the pixels per degree the source had, which for a
+    65-degree lens is a square nearly three times its width and for a 49-degree
+    one four times.  Not what the frame is written at -- see `patch` -- but what
+    says whether a source has the detail to fill one: a 720-wide clip wants 1980
+    and a ceiling of 4096 will be half empty of anything it can offer.
+    """
+    return width * FOV / fov(focal_px, width)
 
 
 def patch(focal_px, src_w, src_h, cap=MAX_SIZE, size=None):
@@ -157,8 +209,14 @@ def patch(focal_px, src_w, src_h, cap=MAX_SIZE, size=None):
     is a full 180 by 180, and showed a 65-by-91-degree patch 2.7 times too close
     and 40% stretched sideways.  See the history for it if a player ever catches
     up.
+
+    And always the ceiling, rather than what the source can fill.  A headset
+    shows 25 pixels a degree whatever it is handed, so a frame short of that is
+    visibly soft however faithfully it matches its source -- and the source is
+    the half of that this cannot fix, which is what `natural_size` is for and
+    what the upscaler in `prepass` is for.
     """
-    side = even(min(cap, size or per_eye(src_w, focal_px, cap)))
+    side = even(max(64, size or cap))
     return Patch(FOV, FOV, side, side)
 
 
@@ -184,13 +242,11 @@ def _elevation(top, rows, spot, device, dtype):
     return span / 2.0 - (row + 0.5) / spot.height * span
 
 
-def _grid(top, rows, spot, focal_px, src_h, src_w, device, dtype):
-    """Where each stored pixel in a band of rows reads from in the source
-    photograph, and whether it reads from anywhere at all.
+def directions(top, rows, spot, device, dtype):
+    """Unit vectors for a band of stored pixels: +x right, +y up, +z forward.
 
-    Azimuth and elevation give a direction; the direction is put back through
-    the pinhole the depth model reported.  Anything behind the camera, or past
-    the edge of the frame, is not in the photograph and is marked as such.
+    Split out of `_grid` because the plate needs the same directions without the
+    pinhole behind them -- it is looking up a sphere, not a photograph.
     """
     col = torch.arange(spot.width, device=device, dtype=dtype)
     span_az = math.radians(spot.span_az)
@@ -198,9 +254,34 @@ def _grid(top, rows, spot, focal_px, src_h, src_w, device, dtype):
     el = _elevation(top, rows, spot, device, dtype)[:, None]
 
     cos_el, sin_el = torch.cos(el), torch.sin(el)
-    x = torch.sin(az)[None, :] * cos_el
-    y = sin_el.expand(rows, spot.width)
-    z = torch.cos(az)[None, :] * cos_el
+    return (torch.sin(az)[None, :] * cos_el,
+            sin_el.expand(rows, spot.width),
+            torch.cos(az)[None, :] * cos_el)
+
+
+def turn(x, y, z, rotation):
+    """Rotate a field of directions.  `rotation` is a 3x3 taking the directions
+    given into the frame they should be read in."""
+    r = rotation.to(device=x.device, dtype=x.dtype)
+    return (r[0, 0] * x + r[0, 1] * y + r[0, 2] * z,
+            r[1, 0] * x + r[1, 1] * y + r[1, 2] * z,
+            r[2, 0] * x + r[2, 1] * y + r[2, 2] * z)
+
+
+def _grid(top, rows, spot, focal_px, src_h, src_w, device, dtype, rotation=None):
+    """Where each stored pixel in a band of rows reads from in the source
+    photograph, and whether it reads from anywhere at all.
+
+    Azimuth and elevation give a direction; the direction is put back through
+    the pinhole the depth model reported.  Anything behind the camera, or past
+    the edge of the frame, is not in the photograph and is marked as such.
+
+    `rotation` turns the directions first, which is what lets a frame shot with
+    the camera pointing somewhere else be laid on the same plate -- see `plate`.
+    """
+    x, y, z = directions(top, rows, spot, device, dtype)
+    if rotation is not None:
+        x, y, z = turn(x, y, z, rotation)
 
     # Behind the camera divides by a negative and folds the picture back on
     # itself, so it is held at 1 for the arithmetic and thrown away by the mask.
@@ -217,12 +298,24 @@ def _grid(top, rows, spot, focal_px, src_h, src_w, device, dtype):
     return torch.stack((gx, gy), dim=-1)[None], valid
 
 
-def project(source, focal_px, spot):
+def project(source, focal_px, spot, mode="bicubic", rotation=None):
     """Warp a `[C, H, W]` perspective image onto the patch, and say which of its
     pixels came from anywhere.
 
     Banded over output rows: a large projection built in one piece is several
     gigabytes, and nothing here needs it to be.
+
+    `mode` is bicubic for colour and wants to be bilinear for depth.  The
+    projection is nearly always enlarging now -- the frame is the ceiling rather
+    than whatever the source could fill -- so the kernel has started to matter,
+    and bicubic costs the same to the millisecond.  But bicubic overshoots at an
+    edge, and an overshoot in an inverse-depth map is not a soft halo, it is a
+    pixel claiming to be somewhere it is not and a disparity to match.
+
+    `rotation` says where the camera was pointing when this frame was taken,
+    relative to whatever the patch is centred on.  A still and every frame of the
+    live picture leave it None, which is the camera pointing straight down the
+    patch's own axis; `plate` passes one to lay a panned frame in the right place.
     """
     src_h, src_w = source.shape[-2:]
     out = torch.zeros(source.shape[0], spot.height, spot.width,
@@ -232,9 +325,9 @@ def project(source, focal_px, spot):
     for top in range(0, spot.height, band):
         rows = min(band, spot.height - top)
         grid, valid = _grid(top, rows, spot, focal_px, src_h, src_w,
-                            source.device, source.dtype)
+                            source.device, source.dtype, rotation)
         out[:, top:top + rows] = F.grid_sample(
-            source[None], grid, mode="bilinear", padding_mode="zeros", align_corners=False)[0]
+            source[None], grid, mode=mode, padding_mode="zeros", align_corners=False)[0]
         mask[top:top + rows] = valid
     return out, mask
 
@@ -253,7 +346,7 @@ def coverage(mask, spot):
     return float((mask.float() * weight).sum()) * per_pixel / (2.0 * math.pi)
 
 
-def _falloff(mask, spot):
+def _falloff(mask, spot, falloff_deg=FALLOFF_DEG):
     """A soft edge at the boundary of the real picture, in place of a cut one.
 
     The blur of a hard mask runs from one deep inside to zero outside, which is
@@ -263,12 +356,13 @@ def _falloff(mask, spot):
     a picture that does reach the edge is not darkened there for the crime of
     having no room to spare.
     """
-    radius = max(1, round(FALLOFF_DEG * spot.width / spot.span_az))
+    radius = max(1, round(falloff_deg * spot.width / spot.span_az))
     soft = stereo._box(mask.float()[None, None], radius)[0, 0].clamp_(0, 1)
     return mask.float() * (soft * soft * (3.0 - 2.0 * soft))  # smoothstep
 
 
-def surround(equirect, mask, spot, dim=SURROUND_DIM, blur_deg=SURROUND_BLUR_DEG):
+def surround(equirect, mask, spot, dim=SURROUND_DIM, blur_deg=SURROUND_BLUR_DEG,
+             ramp_deg=SURROUND_RAMP_DEG):
     """A dim, blurred wash for the part of the sphere the photograph never
     reached -- what every social video site puts behind a clip that does not
     fill the frame.
@@ -308,7 +402,45 @@ def surround(equirect, mask, spot, dim=SURROUND_DIM, blur_deg=SURROUND_BLUR_DEG)
         seen = weight.clamp(0, 1)
         out = seen * (colour / weight.clamp_min(1e-6)) + (1 - seen) * out
     out = F.interpolate(out, size=tuple(mask.shape), mode="bilinear", align_corners=False)
-    return (out[0] * dim).clamp_(0, 1)
+    return _ease(out[0], mask, spot, dim, ramp_deg)
+
+
+def _ease(wash, mask, spot, dim, ramp_deg=SURROUND_RAMP_DEG):
+    """The wash at the picture's own strength where it leaves the picture, eased
+    to `dim` further out.
+
+    Both ends go through `_expose`, so a brightness above 1 still screens rather
+    than clamps and the two halves still meet without a step at exactly 1.  What
+    changes is only *where* each applies: the edge of the photograph is the one
+    place a viewer's eye is guaranteed to be, and it is the one place the wash
+    should be indistinguishable from what it is spreading.
+    """
+    lit = _expose(wash, 1.0)
+    if not ramp_deg or float(dim) == 1.0:
+        return _expose(wash, dim)
+    radius = max(1, round(ramp_deg * spot.width / spot.span_az))
+    near = stereo._box(mask.float()[None, None], radius)[0, 0].clamp(0, 1)
+    near = near * near * (3.0 - 2.0 * near)  # smoothstep, out from the edge
+    return torch.lerp(_expose(wash, dim), lit, near)
+
+
+def _expose(wash, gain):
+    """Set how bright the surround is.  Below 1 that is a plain multiply; above
+    it, the wash is being asked for more light than it measured.
+
+    A dark scene spreads a dark wash, and turning the number up is the only way
+    to light one -- but multiplying past 1 and clamping would stop every channel
+    at the same place, so a bright corner would lose its colour before it lost
+    its shape and land as a flat white blob, exactly where a viewer's eye is
+    most easily caught.  So above 1 the wash is screened into itself instead:
+    `1 - (1 - w)**gain`, which reaches for white without ever arriving, leaves 0
+    at 0, and is the identity at gain 1 -- so the two halves meet without a step
+    and a number chosen by eye keeps meaning what it meant.
+    """
+    gain = float(gain)
+    if gain <= 1.0:
+        return (wash * gain).clamp_(0, 1)
+    return (1.0 - (1.0 - wash.clamp(0, 1)) ** gain).clamp_(0, 1)
 
 
 def half_disparity(inverse, spot, eyes_mm, focus_m, limit_deg=LIMIT_DEG, elevation=None):
@@ -334,18 +466,28 @@ def half_disparity(inverse, spot, eyes_mm, focus_m, limit_deg=LIMIT_DEG, elevati
 
 
 def render(rgb, inverse, focal_px, eyes_mm, focus_m, spot, limit_deg=LIMIT_DEG,
-           wash=False):
+           wash=0.0, plate=None, plate_dim=PLATE_DIM):
     """One flat frame and its depth in; a VR180 eye pair and its coverage out.
 
     `rgb` is `[3, H, W]` in [0, 1] and `inverse` the matching `[H, W]` inverse
     depth in 1/metres -- both as the flat path has them, because both are warped
     from there rather than estimated here.
 
-    `wash` fills the empty part of the sphere with `surround` instead of leaving
-    it black.
+    `wash` is how bright to make the `surround` that fills the empty part of the
+    sphere, 0 for none -- which is the same thing as saying the dark is a
+    surround with no light in it.
+
+    `plate` is `(colour, mask)` on this same grid: the scene this shot was
+    actually filmed in, gathered once by `plate.build` and handed here already
+    turned to this frame's own bearing.  It goes *behind* the picture and *in
+    front of* the wash, so the three of them read outwards as photograph, then
+    scene, then light.  Everything about why it is built once per shot rather
+    than once per frame is in `plate`; what matters here is only that it arrives
+    fixed, so nothing this function does can make it boil.
     """
     equirect, mask = project(rgb, focal_px, spot)
-    depth, _ = project(inverse[None], focal_px, spot)
+    equirect.clamp_(0, 1)  # bicubic overshoots, and this is colour
+    depth, _ = project(inverse[None], focal_px, spot, mode="bilinear")
     # Nothing was ever pointed at the void, so it has no depth either.  Parked at
     # the screen plane it asks for no separation, which keeps it still and stops
     # the splat dragging it sideways over the edge of the real picture.
@@ -358,9 +500,53 @@ def render(rgb, inverse, focal_px, eyes_mm, focus_m, spot, limit_deg=LIMIT_DEG,
     left, right = stereo.make_pair(equirect, half, margin=0)
 
     fade = _falloff(mask, spot)
-    if not wash:
+    behind = _behind(equirect, mask, spot, wash, plate, plate_dim)
+    if behind is None:
         return left * fade, right * fade, mask
-    # One wash, both eyes, from the picture before it was split -- see
+    # One backdrop, both eyes, from the picture before it was split -- see
     # `surround` for why it must not have a parallax of its own.
-    fill = surround(equirect, mask, spot)
-    return torch.lerp(fill, left, fade), torch.lerp(fill, right, fade), mask
+    return torch.lerp(behind, left, fade), torch.lerp(behind, right, fade), mask
+
+
+def _behind(equirect, mask, spot, wash, plate, plate_dim):
+    """Everything the photograph is shown in front of, or None for plain dark.
+
+    The wash is spread out of the plate rather than out of the frame wherever
+    there is a plate, which is not a detail: it means the light at the edge of
+    the sphere is the light of whatever the camera turned to see in that
+    direction, and it means the wash and the plate meet without a step because
+    one is made from the other.
+    """
+    if plate is None:
+        return surround(equirect, mask, spot, dim=float(wash)) if wash else None
+
+    colour, seen = plate
+    colour = _match_gain(colour, equirect, seen & mask) * plate_dim
+    colour = colour.clamp_(0, 1)
+    # What the wash is spread from: photograph where there is any, and the plate
+    # everywhere else it reaches.
+    source = torch.where(mask, equirect, colour)
+    lit = surround(source, mask | seen, spot, dim=float(wash)) if wash else torch.zeros_like(colour)
+    # A wider fade than the picture's, because this is the join between what was
+    # filmed and what was inferred from it -- and a hard circle where the painted
+    # ring stops is the one thing a viewer's eye goes straight to.
+    return torch.lerp(lit, colour, _falloff(seen, spot, PLATE_FALLOFF_DEG))
+
+
+def _match_gain(colour, equirect, overlap, limit=2.0):
+    """Scale the plate to the brightness the live frame is at.
+
+    A phone's automatic exposure walks across a shot, so a plate median-combined
+    over the whole of one sits at the average exposure and the frame in front of
+    it does not.  Left alone that is a visible step at the edge of the picture,
+    on footage where nothing else went wrong.  Clamped, because an overlap of
+    almost nothing -- the first frame of a whip pan -- would otherwise produce a
+    ratio of almost anything.
+    """
+    if not bool(overlap.any()):
+        return colour
+    here = float(colour[:, overlap].mean())
+    there = float(equirect[:, overlap].mean())
+    if here < 1e-4:
+        return colour
+    return colour * min(max(there / here, 1.0 / limit), limit)

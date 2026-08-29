@@ -11,8 +11,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
 
-from . import budget, spherical, stereo, vr180
-from .depth import DepthEstimator, exif_focal
+from . import budget, logbook, spherical, stereo, vr180
+from .depth import DEFAULT_FOCAL_35MM, DepthEstimator, exif_focal, focal_from_35mm
 
 pillow_heif.register_heif_opener()
 
@@ -20,19 +20,56 @@ SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", 
 
 # Every name the app writes.  Nothing inside a JPEG or an mp4 announces how it is
 # meant to be looked at, so players go by the file name -- which makes these load
-# -bearing rather than decorative.  "_180_sbs" carries the two tokens every
-# headset player keys on independently: 180 sets the projection, sbs the layout.
-# Kept in one list because `cli.collect` reads it to avoid converting its own
-# output all over again when it is pointed at a folder twice.
-SBS_TAGS = ("_sbs", "_sbs_cross", "_180_sbs", "_180_sbs_cross")
+# -bearing rather than decorative, and makes the exact spelling matter far more
+# than it looks.
+#
+# Skybox's published rules are a list of tokens and nothing else.  The angle is
+# "360" or "180x180"; **a bare "180" is not on the list**.  The layout is "sbs",
+# "lr" or "3dh" for a pair, "hsbs" or "half sbs" for one squeezed to half width,
+# and "full sbs" for one that kept it -- and where the layout is not spelled out,
+# a still is assumed to be half width.  Separators and case do not matter, so
+# "full_sbs" and "Full SBS" are the same token.
+#
+# The old "_180_sbs" therefore said layout and no angle at all, and both things
+# that went wrong in a headset follow from that one fact: a clip with no angle is
+# shown on a cinema screen rather than wrapped onto the sphere, and a photo is
+# shown on that screen at half width, which stretches each eye across twice the
+# width it belongs in.  Hence "180x180" for the angle, said the way the rules say
+# it, and the width said out loud rather than guessed at.
+#
+# Every name still ends in one of the four below, which is what `cli.collect`
+# reads to avoid converting its own output all over again when it is pointed at a
+# folder twice -- "_180x180_full_sbs" ends in "_sbs", and so does a file an
+# earlier version left behind as "_180_sbs".
+SBS_TAGS = ("_sbs", "_sbs_cross", "_hsbs", "_hsbs_cross")
+
+
+def full_width(settings):
+    """Whether each eye keeps its own full width in the finished frame.
+
+    A photo always does.  A flat clip is squeezed to half width unless `--full`
+    says otherwise, that being the size players and their hardware decoders
+    expect.  A vr180 clip never is: there the frame size comes from the
+    projection rather than from the source, so `video.geometry` gives every eye
+    the whole square and `full_width` has nothing left to decide.
+    """
+    return settings.projection == "vr180" or getattr(settings, "full_width", True)
 
 
 def tag(settings):
     """What to call the output, which is the only way a player will know what it
     is looking at.  A cross-eyed pair is right|left, and shown to a headset as
-    though it were left|right it puts each eye on the other one's view."""
-    name = "_180_sbs" if settings.projection == "vr180" else "_sbs"
-    return f"{name}_cross" if settings.cross_eyed else name
+    though it were left|right it puts each eye on the other one's view -- that
+    last token is for the human reading the folder, no player having a word for
+    it.
+    """
+    parts = []
+    if settings.projection == "vr180":
+        parts.append("180x180")
+    parts.append("full_sbs" if full_width(settings) else "hsbs")
+    if settings.cross_eyed:
+        parts.append("cross")
+    return "_" + "_".join(parts)
 
 
 @dataclass
@@ -64,18 +101,24 @@ class Settings:
     # its true angular scale instead, which is more immersive where the photo
     # reaches and simply dark where it does not -- see `vr180`.
     projection: str = "flat"
-    # Stored width per eye for the vr180 projection, or auto to keep the photo's
-    # own, capped at `vr180_cap`.  Only the piece of sphere the photo covers is
-    # stored, so this buys picture rather than dark -- see `vr180`.
+    # Stored width per eye for the vr180 projection, or auto to keep as much of
+    # the source's own detail as `vr180_cap` has room for -- see `vr180`.
     vr180_size: object = "auto"
-    vr180_cap: int = vr180.MAX_SIZE
-    # Fill the part of the sphere the picture never reached with a dim, blurred
-    # spread of the picture, instead of leaving it black -- what a social video
-    # site puts behind a clip that does not fill the frame.  Off by default
-    # because it is the one thing here that is not measured; on, it is still a
-    # fixed function of the frame rather than anything invented, so a clip
-    # cannot crawl with it.  See `vr180.surround`.
-    vr180_surround: bool = False
+    vr180_cap: object = vr180.MAX_SIZE
+    # How brightly to fill the part of the sphere the picture never reached with
+    # a blurred spread of the picture, 0 for not at all -- what a social video
+    # site puts behind a clip that does not fill the frame.  A brightness rather
+    # than a switch because the right amount is a matter of taste and of the
+    # headset: past about half, the wash starts competing with the picture for
+    # the eye.  0 by default, this being the one thing here that is not
+    # measured.  See `vr180.surround`.
+    vr180_surround: float = 0.0
+    # Called with anything the user should be told that is not the result --
+    # a pass skipped for want of memory, a fallback taken, a quality traded.
+    # Left unset it goes to stderr, which suits the command line and reaches
+    # nobody at all in the window: the frozen app is built with no console, so
+    # a warning printed there is a warning discarded.  See `notice`.
+    on_notice: object = None
     # Called when a photo will not fit, with the `TooBig` describing it, and
     # expected to return "resize" or "skip".  Left unset nothing is ever
     # silently downscaled: the photo is skipped and the caller told why.
@@ -108,9 +151,36 @@ class VideoSettings(Settings):
 
     target_pct: float = 1.3
     depth_size: object = 1400
-    # Lower than a still's, because every frame has to come back out of a
-    # hardware decoder and 2048 per eye is already 4096 across.
-    vr180_cap: int = vr180.VIDEO_MAX_SIZE
+    # Enhance the source before converting it, where it is short of what the
+    # frame can hold -- see `prepass`.  Both only act when they are needed: a
+    # clip already at the ceiling is not upscaled and one already at 60fps is
+    # not interpolated, so leaving them on costs nothing on footage that has
+    # nothing to gain.
+    upscale: bool = False
+    # How much of the upscaler's own picture to keep, against a plain
+    # enlargement of the source: 1.0 for all of it, 0 for an honest resample and
+    # nothing invented, None for the model's own default.  The knob for footage
+    # that comes back looking painted rather than filmed -- see `upscale.DETAIL`.
+    upscale_detail: object = None
+    interpolate: bool = False
+    # Fill the part of the sphere the lens never reached with the scene the clip
+    # was actually shot in, rather than with dark or a blurred wash -- gathered
+    # once per shot, which is what keeps it from boiling.  See `plate`.  vr180
+    # only: a flat pair is photograph edge to edge and has no periphery to fill.
+    outpaint: bool = False
+    # How far past the source's own field of view to widen it, in degrees.  A
+    # knob rather than a constant because the trade is a matter of taste: more
+    # reach fills more of the sphere and leaves the model less to go on.  See
+    # `outpaint`.
+    outpaint_reach: float = 40.0
+    # Which model does the widening, or "auto" for the best one whose weights
+    # are to hand -- see `outpaint.PREFERRED`.
+    outpaint_model: str = "auto"
+    # None rather than a number, because what a clip can afford depends on how
+    # fast it runs and a class attribute cannot see the clip.  `video.geometry`
+    # asks `vr180.video_cap` once the frame rate is known; a number here is
+    # taken as given instead.
+    vr180_cap: object = None
     # Squeeze each eye to half width, so the clip comes out the size it went in.
     # That is what players and headsets expect, and what their hardware decoders
     # can actually keep up with -- full width doubles it, and 4K doubled is past
@@ -119,7 +189,9 @@ class VideoSettings(Settings):
     # How much of the previous frame's depth to keep, 0 for none.
     temporal: float = 0.5
     crf: int = 18
-    codec: str = "h264"
+    # "auto" writes h264 where a headset will decode it and hevc where it will
+    # not -- see `video.codec_for`.  A name here is taken at face value.
+    codec: str = "auto"
     audio: bool = True
 
 
@@ -181,6 +253,44 @@ class TooBig(Exception):
         return "\n".join(lines)
 
 
+def vr180_frame(settings, width, height, focal=None):
+    """Pixels in the finished frame, for a vr180 conversion that has not started.
+
+    The memory check runs before anything is decoded, so the lens here is
+    whatever EXIF or the default says rather than what the depth model will
+    report later.  Being a little out costs a little accuracy in the estimate;
+    not asking at all costs the estimate entirely, a hemisphere being up to
+    sixty times the area of the clip that was spread across it.
+    """
+    if settings.projection != "vr180":
+        return None
+    spot = vr180.patch(focal or focal_from_35mm(DEFAULT_FOCAL_35MM, width), width, height,
+                       settings.vr180_cap or vr180.MAX_SIZE,
+                       None if settings.vr180_size in (None, 0, "auto")
+                       else int(settings.vr180_size))
+    return 2 * spot.width * spot.height
+
+
+def notice(settings, message):
+    """Tell the user something that is not the answer.
+
+    This exists because the alternative had already gone wrong: "not enough
+    memory to add detail" went to stderr, the window is frozen with no console,
+    and so a conversion quietly did less than it was asked to and said nothing.
+    A warning nobody can see is not a warning.
+    """
+    # Into the log as well as onto the screen.  A notice is the app saying it
+    # did less than it was asked to, which is exactly the thing someone reads
+    # the log to find out afterwards -- and the dialog it went to is long gone
+    # by then.
+    logbook.note("notice", said=repr(message))
+    handler = getattr(settings, "on_notice", None)
+    if handler is None:
+        print(message, file=sys.stderr)
+    else:
+        handler(message)
+
+
 def photo_size(path):
     """The photo's dimensions without decoding it, EXIF orientation included."""
     with Image.open(path) as img:
@@ -207,7 +317,7 @@ def load_image(path, size=None):
         return np.array(ImageOps.exif_transpose(img).convert("RGB"))
 
 
-def output_path(src, dst, fmt, name="_sbs"):
+def output_path(src, dst, fmt, name="_full_sbs"):
     src = Path(src)
     ext = src.suffix.lower() if fmt == "auto" else f".{fmt}"
     if ext not in (".jpg", ".jpeg", ".png"):
@@ -335,7 +445,7 @@ class Converter:
         # Without someone to ask, nothing is quietly downscaled behind the
         # caller's back -- the photo is skipped and they are told about it.
         if ask is None:
-            print(oversize.describe(), file=sys.stderr)
+            notice(self.settings, oversize.describe())
             return "skip"
         return ask(oversize)
 
@@ -352,7 +462,7 @@ class Converter:
             gpu = self.depth_model.device
             if gpu.type == "cpu":
                 raise self._too_big(problem, src, size, [gpu]) from None
-            print(f"{Path(src).name}: too big for GPU memory, trying the CPU", file=sys.stderr)
+            notice(self.settings, f"{Path(src).name}: too big for GPU memory, trying the CPU")
             requested, self.settings.device, self._depth = self.settings.device, "cpu", None
             torch.cuda.empty_cache()
             try:
@@ -378,10 +488,12 @@ class Converter:
         spare than the system does -- and the better offer is the one to make.
         """
         estimator, size = self.depth_model, self.settings.depth_size
-        offers = [(budget.plan(estimator, *source, size, device), device) for device in devices]
+        frame = vr180_frame(self.settings, *source)
+        offers = [(budget.plan(estimator, *source, size, device, frame), device)
+                  for device in devices]
         target, device = max(offers, key=lambda offer: _area(offer[0]))
         return TooBig(src, source, target, device,
-                      budget.needs(estimator, *source, size, device),
+                      budget.needs(estimator, *source, size, device, frame),
                       budget.free_bytes(device) or 0, self.settings.limit_pct,
                       None if target else budget.smaller_model(estimator, *source, size, device))
 
@@ -401,7 +513,7 @@ class Converter:
             focus = float(cfg.focus_m)
         return eyes, focus
 
-    def render(self, image, normalizer=None, margin=None, focal=None, spot=None):
+    def render(self, image, normalizer=None, margin=None, focal=None, spot=None, plate=None):
         """One frame in; the two eye views and the depth map behind them out.
 
         Composing is left to the caller because a video squeezes each eye to half
@@ -417,6 +529,9 @@ class Converter:
         reason `margin` exists: left to work itself out from the lens it could
         come out a different size from one frame to the next, and no encoder
         will take that.
+
+        `plate` is this frame's view of the scene around it, from `plate.Plates`,
+        and is passed straight through to `vr180.render`.
         """
         cfg = self.settings
         estimator = self.depth_model
@@ -441,7 +556,7 @@ class Converter:
         # The lens, restated in pixels at the width actually being rendered.
         focal_full = depth.focal * width / depth.working[1]
         if cfg.projection == "vr180":
-            return self._render_vr180(rgb, inverse, focal_full, spot)
+            return self._render_vr180(rgb, inverse, focal_full, spot, plate)
 
         eyes, focus = self.geometry(inverse, width, focal_full)
         half = stereo.half_disparity(inverse, focal_full, eyes, focus, cfg.limit_pct, width)
@@ -450,7 +565,7 @@ class Converter:
         self.covered = None  # a flat frame is photograph edge to edge
         return left, right, inverse
 
-    def _render_vr180(self, rgb, inverse, focal_full, spot=None):
+    def _render_vr180(self, rgb, inverse, focal_full, spot=None, plate=None):
         """The same frame, on a hemisphere instead of a plane.
 
         The depth map is not re-estimated here.  It was measured on the
@@ -469,7 +584,8 @@ class Converter:
         """
         cfg = self.settings
         if spot is None:
-            spot = vr180.patch(focal_full, rgb.shape[2], rgb.shape[1], cfg.vr180_cap,
+            spot = vr180.patch(focal_full, rgb.shape[2], rgb.shape[1],
+                               cfg.vr180_cap or vr180.MAX_SIZE,
                                None if cfg.vr180_size in (None, 0, "auto")
                                else int(cfg.vr180_size))
         # Asked against the projection rather than the photo: a baseline is a
@@ -477,7 +593,7 @@ class Converter:
         # set by how far the picture is stretched to get onto the sphere.
         eyes, focus = self.geometry(inverse, spot.width, spot.per_radian, vr180.auto_target(spot))
         left, right, mask = vr180.render(rgb, inverse, focal_full, eyes, focus, spot,
-                                         wash=cfg.vr180_surround)
+                                         wash=cfg.vr180_surround, plate=plate)
         self.chose = (eyes, focus)
         self.covered = vr180.coverage(mask, spot)
         self.spot = spot
@@ -495,7 +611,8 @@ class Converter:
         # the process with it rather than an exception anyone can catch.
         if size is None:
             source = photo_size(src)
-            if not budget.fits(estimator, *source, cfg.depth_size):
+            frame = vr180_frame(cfg, *source, exif_focal(src, source[0]))
+            if not budget.fits(estimator, *source, cfg.depth_size, frame=frame):
                 raise self._proposal(src, source, [device])
 
         image = load_image(src, size)

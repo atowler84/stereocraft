@@ -55,10 +55,21 @@ class TestGpano:
     def spot(self):
         return vr180.patch(lens(28, 4000), 4000, 3000)
 
-    def test_says_it_is_a_panorama_and_which_kind(self):
+    def test_says_which_kind_of_panorama_the_numbers_describe(self):
         text = spherical.gpano(self.spot()).decode()
-        assert 'GPano:UsePanoramaViewer="True"' in text
         assert 'GPano:ProjectionType="equirectangular"' in text
+
+    def test_it_does_not_ask_to_be_opened_as_one(self):
+        """The fields describe one eye and the file holds two side by side.
+        Asking a viewer to wrap the frame it has round a sphere is how a
+        monoscopic 360 declares itself, and a 2:1 pair that gets believed comes
+        out at twice the width it belongs at."""
+        assert 'GPano:UsePanoramaViewer="False"' in spherical.gpano(self.spot()).decode()
+
+    def test_a_caller_that_means_it_can_still_say_so(self):
+        """For a single-eye frame, where the claim would be true."""
+        assert 'GPano:UsePanoramaViewer="True"' in spherical.gpano(self.spot(),
+                                                                   viewer=True).decode()
 
     def test_the_stored_size_is_what_is_stored(self):
         spot = self.spot()
