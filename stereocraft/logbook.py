@@ -172,7 +172,7 @@ def memory():
     if sys.platform == "win32":
         return _windows_memory()
     try:
-        current = peak = 0
+        current = peak = None
         with open("/proc/self/status") as handle:
             for line in handle:
                 if line.startswith("VmRSS:"):
@@ -181,11 +181,24 @@ def memory():
                     peak = int(line.split()[1]) * 1024
         return current, peak
     except (OSError, ValueError, IndexError):
-        return 0, 0
+        return None, None
 
 
 @functools.lru_cache(maxsize=1)
 def _psapi():
+    """`GetProcessMemoryInfo`, its argument types declared, and our own handle.
+
+    **Declaring the types is the entire reason this is a function.**  A process
+    handle is a pointer, and ctypes assumes a C int for anything it has not been
+    told about -- so on 64-bit Windows `GetCurrentProcess()` came back truncated
+    to 32 bits and every call failed.  It failed the quiet way, too: the API
+    reports failure by returning zero rather than by raising, so the log simply
+    printed `peak=?` in precisely the situation it was written for.
+
+    `K32GetProcessMemoryInfo` is preferred because it is in kernel32, which is
+    loaded already; psapi carries the same call under its older name for
+    anything that does not have it.
+    """
     import ctypes
     import ctypes.wintypes
 
@@ -201,22 +214,33 @@ def _psapi():
                     ("PagefileUsage", ctypes.c_size_t),
                     ("PeakPagefileUsage", ctypes.c_size_t)]
 
-    return ctypes, Counters
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetCurrentProcess.argtypes = []
+
+    ask = None
+    for library, name in ((kernel32, "K32GetProcessMemoryInfo"),
+                          (ctypes.WinDLL("psapi"), "GetProcessMemoryInfo")):
+        ask = getattr(library, name, None)
+        if ask is not None:
+            break
+    if ask is None:
+        raise OSError("no GetProcessMemoryInfo on this Windows")
+    ask.restype = ctypes.wintypes.BOOL
+    ask.argtypes = [ctypes.c_void_p, ctypes.POINTER(Counters), ctypes.wintypes.DWORD]
+    return ctypes, Counters, ask, kernel32.GetCurrentProcess()
 
 
 def _windows_memory():
     try:
-        ctypes, Counters = _psapi()
+        ctypes, Counters, ask, process = _psapi()
         counters = Counters()
         counters.cb = ctypes.sizeof(counters)
-        ok = ctypes.WinDLL("psapi").GetProcessMemoryInfo(
-            ctypes.WinDLL("kernel32").GetCurrentProcess(),
-            ctypes.byref(counters), counters.cb)
-        if not ok:
-            return 0, 0
+        if not ask(process, ctypes.byref(counters), counters.cb):
+            return None, None
         return counters.WorkingSetSize, counters.PeakWorkingSetSize
     except Exception:
-        return 0, 0
+        return None, None
 
 
 def total_memory():
@@ -242,7 +266,7 @@ def total_memory():
             ctypes.WinDLL("kernel32").GlobalMemoryStatusEx(ctypes.byref(status))
             return int(status.ullTotalPhys)
         except Exception:
-            return 0
+            return None
     try:
         with open("/proc/meminfo") as handle:
             for line in handle:
@@ -250,11 +274,15 @@ def total_memory():
                     return int(line.split()[1]) * 1024
     except (OSError, ValueError, IndexError):
         pass
-    return 0
+    return None
 
 
 def _gb(value):
-    return f"{value / 1e9:.2f}G" if value else "?"
+    """Bytes as gigabytes, and `?` only for genuinely not knowing.
+
+    Zero is a real answer -- an idle card has nothing on it -- and printing it
+    as `?` made a working measurement look like a broken one."""
+    return "?" if value is None else f"{value / 1e9:.2f}G"
 
 
 def cuda_memory():

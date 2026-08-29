@@ -75,17 +75,32 @@ class TestTheMemoryTrail:
     it went.  Peak rather than current, because current is a sample and misses
     the spike that did it."""
 
-    def test_it_reports_a_peak_at_least_as_big_as_the_current(self):
-        current, peak = logbook.memory()
-        assert peak >= current
+    def test_it_actually_measures_something(self):
+        """The one that matters, and the one that was wrong.
 
-    def test_and_the_numbers_are_plausible_for_a_python_holding_torch(self):
-        current, _ = logbook.memory()
+        On Windows the call takes a process handle, which is a pointer -- and
+        ctypes assumes a C int for anything it has not been told about, so the
+        handle arrived truncated to 32 bits and every call failed.  It failed
+        the quiet way, returning zero rather than raising, so the log printed
+        `peak=?` in exactly the situation it was written for and the build went
+        out looking fine.  Nothing short of asserting a real number catches
+        that.
+        """
+        current, peak = logbook.memory()
+        assert current is not None and peak is not None
         assert current > 1_000_000  # more than a megabyte, less than absurd
         assert current < 1_000_000_000_000
+        assert peak >= current
 
     def test_the_machine_has_some_ram(self):
-        assert logbook.total_memory() > 0
+        assert logbook.total_memory() > 1_000_000_000
+
+    def test_nothing_known_is_told_apart_from_nothing_used(self):
+        """An idle card really does have nothing on it, and saying `?` for that
+        made a working measurement look like a broken one."""
+        assert logbook._gb(None) == "?"
+        assert logbook._gb(0) == "0.00G"
+        assert logbook._gb(2_000_000_000) == "2.00G"
 
     def test_a_stage_records_what_it_cost(self, fresh):
         logbook.start()
