@@ -279,6 +279,57 @@ def committed():
         return None
 
 
+def process_memory(pid):
+    """`(rss, commit)` for another process, or `(None, None)`.
+
+    The encoder is a child process, and it is the one that actually ran out of
+    memory -- so a log that measures only ourselves is blind to the half of the
+    conversion that failed.  Asking costs a handle and two calls, once every two
+    hundred frames.
+    """
+    if pid is None:
+        return None, None
+    if sys.platform != "win32":
+        try:
+            rss = commit = None
+            with open(f"/proc/{int(pid)}/status") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        rss = int(line.split()[1]) * 1024
+                    elif line.startswith("VmSize:"):
+                        commit = int(line.split()[1]) * 1024
+            return rss, commit
+        except (OSError, ValueError, IndexError):
+            return None, None
+    handle = None
+    try:
+        ctypes, Counters, ask, _ = _psapi()
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        # QUERY_LIMITED_INFORMATION is the one a child of ours is always allowed;
+        # the older pair is for anything that does not honour it.
+        for access in (0x1000, 0x0400 | 0x0010):
+            handle = kernel32.OpenProcess(access, False, int(pid))
+            if handle:
+                break
+        if not handle:
+            return None, None
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not ask(handle, ctypes.byref(counters), counters.cb):
+            return None, None
+        return counters.WorkingSetSize, counters.PrivateUsage
+    except Exception:
+        return None, None
+    finally:
+        if handle:
+            try:
+                ctypes.WinDLL("kernel32").CloseHandle(ctypes.c_void_p(handle))
+            except Exception:
+                pass
+
+
 def headroom():
     """How much the whole machine has left to promise, not just this process.
 

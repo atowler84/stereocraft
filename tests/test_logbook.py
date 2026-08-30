@@ -7,6 +7,7 @@ tests below care most about it never being the thing that breaks.
 """
 
 import logging
+import sys
 
 import pytest
 
@@ -124,3 +125,26 @@ class TestTheMemoryTrail:
         logbook.start()
         with logbook.stage("surround"):
             assert "surround begin" in (fresh / "stereocraft.log").read_text()
+
+
+class TestTheOtherProcess:
+    """The encoder is a child, and it is the one that ran out of memory.  A log
+    that measures only this process is blind to the half of the conversion that
+    actually failed."""
+
+    def test_it_measures_a_process_that_is_not_us(self):
+        import subprocess
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        try:
+            rss, commit = logbook.process_memory(child.pid)
+            assert rss is not None and rss > 0
+            assert commit is not None and commit > 0
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_a_process_that_is_not_there_is_not_an_error(self):
+        assert logbook.process_memory(999999) == (None, None)
+
+    def test_and_neither_is_never_having_started_one(self):
+        assert logbook.process_memory(None) == (None, None)

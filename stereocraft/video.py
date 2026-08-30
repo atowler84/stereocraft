@@ -513,12 +513,14 @@ def _headroom_wanted(geo):
 def _warn_if_full(cfg, name, geo):
     """Say so *before* the wait if the machine is already close to full.
 
-    This is not the app running out of memory; it is the app being refused
-    because everything else on the machine got there first.  It killed a
-    conversion nine hours in, on a machine with a game left running -- and the
-    encoder's complaint at that point ("Cannot allocate memory", from ffmpeg,
-    about a frame) says nothing whatsoever about the actual cause.  Cheap to
-    check, and the cure is one thing the person can do and the app cannot.
+    A conversion at this size runs for hours, and being refused a single frame
+    at the end of it loses all of them.  Whether the memory has gone on this
+    app or on something else is not knowable from here and does not change the
+    advice, so the check is simply whether there is room -- asked once, at the
+    start, while there is still something the person can do about it.
+
+    Not a guess at the cause of any particular failure.  It is the cheap
+    question that was never asked, and an eleven-hour job deserves it.
     """
     free = logbook.headroom()
     wanted = _headroom_wanted(geo)
@@ -747,9 +749,15 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
                     if done % HEARTBEAT == 0:
                         current, peak = logbook.memory()
                         card = logbook.cuda_memory()
+                        # The encoder as well as ourselves.  It is a separate
+                        # process and it is the one that ran out of memory, so
+                        # measuring only this side is measuring the wrong half.
+                        enc_rss, enc_commit = logbook.process_memory(encoder.pid)
                         logbook.note("rendering", frame=done, of=clip.frames,
                                      **logbook.usage(),
                                      rss=logbook._gb(current), peak=logbook._gb(peak),
+                                     enc=logbook._gb(enc_rss),
+                                     enc_commit=logbook._gb(enc_commit),
                                      **({"cuda": logbook._gb(card[0])} if card else {}))
                     if on_progress and on_progress(done, clip.frames, time.perf_counter() - started) is False:
                         cancelled = True

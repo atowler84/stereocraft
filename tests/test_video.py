@@ -364,11 +364,11 @@ class TestHugeFramesGiveUpFrameParallelism:
 
 
 class TestItSaysSoBeforeTheWaitRatherThanAfter:
-    """A conversion refused an allocation nine hours in, on a machine that had a
-    game left running and 14 GB of commit left out of 72.  Nothing was leaking:
-    everything else had got there first.  ffmpeg's complaint at that point --
-    "Cannot allocate memory", about one frame -- says nothing about the cause,
-    so the check belongs at the start where it can still be acted on."""
+    """A conversion was refused an allocation nine hours in, and every frame
+    rendered up to that point went with it.  ffmpeg's complaint -- "Cannot
+    allocate memory", about one frame -- arrives far too late to act on, so the
+    room available is asked about at the start instead, where it is still worth
+    knowing."""
 
     class _Geo:
         def __init__(self, width, height):
