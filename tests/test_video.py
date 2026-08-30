@@ -361,3 +361,43 @@ class TestHugeFramesGiveUpFrameParallelism:
 
     def test_a_hardware_encoder_is_not_told_about_x265_options(self):
         assert video._thrift("hevc_nvenc", 8192, 8192) == []
+
+
+class TestItSaysSoBeforeTheWaitRatherThanAfter:
+    """A conversion refused an allocation nine hours in, on a machine that had a
+    game left running and 14 GB of commit left out of 72.  Nothing was leaking:
+    everything else had got there first.  ffmpeg's complaint at that point --
+    "Cannot allocate memory", about one frame -- says nothing about the cause,
+    so the check belongs at the start where it can still be acted on."""
+
+    class _Geo:
+        def __init__(self, width, height):
+            self.width, self.height = width, height
+
+    def _said(self, monkeypatch, free, geo):
+        heard = []
+        monkeypatch.setattr(video.logbook, "headroom", lambda: free)
+        settings = video.VideoSettings()
+        settings.on_notice = heard.append
+        video._warn_if_full(settings, "clip.mp4", geo)
+        return heard
+
+    def test_a_full_machine_is_worth_saying_out_loud(self, monkeypatch):
+        said = self._said(monkeypatch, 3_000_000_000, self._Geo(8192, 4096))
+        assert said and "GB" in said[0]
+
+    def test_an_empty_one_is_not(self, monkeypatch):
+        assert not self._said(monkeypatch, 60_000_000_000, self._Geo(8192, 4096))
+
+    def test_a_small_frame_wants_less_and_so_is_not_warned_about(self, monkeypatch):
+        """The same 6 GB that is tight for an 8K sphere is ample for 1080p, so
+        the threshold has to follow the frame rather than be one number."""
+        assert not self._said(monkeypatch, 6_000_000_000, self._Geo(1920, 1080))
+        assert self._said(monkeypatch, 6_000_000_000, self._Geo(8192, 4096))
+
+    def test_not_knowing_is_not_a_warning(self, monkeypatch):
+        assert not self._said(monkeypatch, None, self._Geo(8192, 4096))
+
+    def test_an_8k_frame_wants_more_than_a_1080p_one(self):
+        assert (video._headroom_wanted(self._Geo(8192, 4096))
+                > 2 * video._headroom_wanted(self._Geo(1920, 1080)))

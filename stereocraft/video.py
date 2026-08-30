@@ -356,6 +356,24 @@ def output_path(src, dst=None, name="_full_sbs"):
     return dst
 
 
+def _write_all(stream, frame):
+    """Push one finished frame down the pipe, the whole of it.
+
+    A raw pipe may take less than it is handed, and at 8K a frame is 100 MB --
+    far past what either platform moves in one call -- so the loop is what makes
+    a short write a detail rather than a torn frame.  `write` returning None is
+    a buffered stream saying it took everything.
+    """
+    view = memoryview(frame).cast("B")
+    while view:
+        written = stream.write(view)
+        if written is None:
+            return
+        if not written:
+            raise BrokenPipeError("the encoder stopped taking frames")
+        view = view[written:]
+
+
 def _read_exactly(stream, view):
     """Fill `view` from `stream`, or report how far it got at the end of the file.
 
@@ -479,6 +497,40 @@ def _remux(picture, src, out, clip, cfg, stderr):
     return subprocess.run(args, stderr=stderr, **NO_CONSOLE).returncode
 
 
+def _headroom_wanted(geo):
+    """Roughly what a conversion of this frame size needs the machine to have
+    left, in bytes of commit.
+
+    Measured rather than reasoned.  An 8192x4096 clip sat at 10 GB of commit in
+    this process with 5 GB in the encoder beside it, and the frame is what drives
+    both -- the renderer holds a handful of them in flight and the encoder holds
+    a lookahead of them.  A fixed base covers the models and the runtime, which
+    are there whatever size the picture is.
+    """
+    return 4_000_000_000 + 80 * geo.width * geo.height * 3
+
+
+def _warn_if_full(cfg, name, geo):
+    """Say so *before* the wait if the machine is already close to full.
+
+    This is not the app running out of memory; it is the app being refused
+    because everything else on the machine got there first.  It killed a
+    conversion nine hours in, on a machine with a game left running -- and the
+    encoder's complaint at that point ("Cannot allocate memory", from ffmpeg,
+    about a frame) says nothing whatsoever about the actual cause.  Cheap to
+    check, and the cure is one thing the person can do and the app cannot.
+    """
+    free = logbook.headroom()
+    wanted = _headroom_wanted(geo)
+    logbook.note("headroom", free=logbook._gb(free), wanted=logbook._gb(wanted))
+    if free is None or free >= wanted:
+        return
+    notice(cfg, f"{name}: this machine has about {free / 1e9:.0f} GB of memory left to "
+                f"promise and a {geo.width}x{geo.height} conversion wants nearer "
+                f"{wanted / 1e9:.0f} GB. It can run for hours and then be refused a "
+                f"single frame; closing whatever else is running is the cure.")
+
+
 def _decode_size(converter, src, clip):
     """The size to decode at: native, something smaller that fits, or nothing.
 
@@ -544,7 +596,9 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
     caller that does not take it sees nothing until the conversion itself
     starts, which is a long time to look at a still bar.  `on_frame` is
     handed each finished frame as it goes by, for showing the work in progress;
-    it costs nothing, the array having had to be made for the encoder anyway.
+    it costs nothing, the array having had to be made for the encoder anyway --
+    but it is the *same* array every time, so anything keeping a frame past the
+    call has to copy it.
 
     Returns what was made, or None if it was cancelled or skipped.
     """
@@ -627,6 +681,7 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
     # writes the finished file directly.
     sound = wants_sound(clip, cfg)
     picture = out.with_name(f"{out.stem}.picture{out.suffix}") if sound else out
+    _warn_if_full(cfg, src.name, geo)
     logbook.note("clip", name=src.name, size=f"{clip.width}x{clip.height}",
                  frames=clip.frames, fps=round(clip.fps, 3),
                  out=f"{geo.width}x{geo.height}", codec=codec_for(geo.width, cfg.codec),
@@ -639,6 +694,16 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
     # Reused rather than reallocated per frame, and writable so that handing it
     # to Torch does not have to copy it first.
     frame = np.frombuffer(buffer, np.uint8).reshape(clip.height, clip.width, 3)
+
+    # One buffer for the finished frame, filled again every time rather than
+    # made again every time.  At 8192x4096 a frame is 100 MB, and the old line
+    # allocated two of them per frame -- one for the download off the card, one
+    # more for the `tobytes` handed to the pipe.  Over the thirty thousand frames
+    # of a long clip that is six terabytes of allocation for a picture that is
+    # always exactly the same size, and it is asked for on a machine where the
+    # encoder next door is trying to reserve 100 MB of its own.
+    canvas = torch.empty((geo.height, geo.width, 3), dtype=torch.uint8)
+    pixels = canvas.numpy()
 
     # Pinned for every frame when the projection is a sphere, and meaningless
     # when it is not.
@@ -672,9 +737,9 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
                     left = _squeeze(left, geo.eye, geo.height)
                     right = _squeeze(right, geo.eye, geo.height)
                     sbs = stereo.compose(left, right, cfg.cross_eyed)
-                    pixels = ((sbs.clamp(0, 1) * 255).round().to(torch.uint8)
-                              .permute(1, 2, 0).contiguous().cpu().numpy())
-                    encoder.stdin.write(pixels.tobytes())
+                    canvas.copy_((sbs.clamp(0, 1) * 255).round().to(torch.uint8)
+                                 .permute(1, 2, 0).contiguous())
+                    _write_all(encoder.stdin, pixels)
                     if on_frame is not None:
                         on_frame(pixels)
 
@@ -683,6 +748,7 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
                         current, peak = logbook.memory()
                         card = logbook.cuda_memory()
                         logbook.note("rendering", frame=done, of=clip.frames,
+                                     **logbook.usage(),
                                      rss=logbook._gb(current), peak=logbook._gb(peak),
                                      **({"cuda": logbook._gb(card[0])} if card else {}))
                     if on_progress and on_progress(done, clip.frames, time.perf_counter() - started) is False:

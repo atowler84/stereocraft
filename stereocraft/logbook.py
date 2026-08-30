@@ -212,7 +212,13 @@ def _psapi():
                     ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
                     ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
                     ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t)]
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                    # The _EX tail.  `GetProcessMemoryInfo` fills it when `cb`
+                    # says the struct is this long, and `PrivateUsage` is the
+                    # commit charge -- which is the number Windows actually
+                    # refuses on, and so the number an allocation failure has to
+                    # be read against.
+                    ("PrivateUsage", ctypes.c_size_t)]
 
     kernel32 = ctypes.WinDLL("kernel32")
     kernel32.GetCurrentProcess.restype = ctypes.c_void_p
@@ -243,30 +249,86 @@ def _windows_memory():
         return None, None
 
 
+def committed():
+    """This process's commit charge, which is what an allocation is refused on.
+
+    Resident set is what the process is *touching*; commit is what it has asked
+    the system to promise it.  Windows hands out `Cannot allocate memory` when
+    the system-wide commit charge reaches the limit, and a process can sit well
+    below its commit in resident pages -- so a log that reports only RSS can
+    show eight comfortable gigabytes on a machine that is about to refuse a
+    hundred-megabyte request.  That is exactly what happened.
+    """
+    if sys.platform != "win32":
+        try:
+            with open("/proc/self/status") as handle:
+                for line in handle:
+                    if line.startswith("VmSize:"):
+                        return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
+    try:
+        ctypes, Counters, ask, process = _psapi()
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not ask(process, ctypes.byref(counters), counters.cb):
+            return None
+        return counters.PrivateUsage
+    except Exception:
+        return None
+
+
+def headroom():
+    """How much the whole machine has left to promise, not just this process.
+
+    The one number that says whether the next big allocation -- ours or
+    ffmpeg's, in its own process -- is going to be refused.
+    """
+    if sys.platform == "win32":
+        status = _status()
+        return None if status is None else int(status.ullAvailPageFile)
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _status():
+    """`GlobalMemoryStatusEx`, freshly asked -- the numbers move."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.wintypes.DWORD),
+                        ("dwMemoryLoad", ctypes.wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        status = Status()
+        status.dwLength = ctypes.sizeof(status)
+        if not ctypes.WinDLL("kernel32").GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return status
+    except Exception:
+        return None
+
+
 def total_memory():
     """How much RAM the machine has, so a peak can be read against something."""
     if sys.platform == "win32":
-        try:
-            import ctypes
-            import ctypes.wintypes
-
-            class Status(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.wintypes.DWORD),
-                            ("dwMemoryLoad", ctypes.wintypes.DWORD),
-                            ("ullTotalPhys", ctypes.c_ulonglong),
-                            ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong),
-                            ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong),
-                            ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-            status = Status()
-            status.dwLength = ctypes.sizeof(status)
-            ctypes.WinDLL("kernel32").GlobalMemoryStatusEx(ctypes.byref(status))
-            return int(status.ullTotalPhys)
-        except Exception:
-            return None
+        status = _status()
+        return None if status is None else int(status.ullTotalPhys)
     try:
         with open("/proc/meminfo") as handle:
             for line in handle:
@@ -336,5 +398,17 @@ def stage(name, **fields):
         current, peak = memory()
         card = cuda_memory()
         note(f"{name} done", took=f"{time.perf_counter() - started:.1f}s",
-             rss=_gb(current), peak=_gb(peak),
+             **usage(), rss=_gb(current), peak=_gb(peak),
              **({"cuda": _gb(card[0]), "cuda_peak": _gb(card[1])} if card else {}))
+
+
+def usage():
+    """The two numbers an allocation failure has to be read against, as fields.
+
+    `commit` is what this process has asked the system to promise; `free` is what
+    the machine has left to promise anybody, this process or the ffmpeg beside
+    it.  Resident set says neither of those things, which is how a log came to
+    show eight comfortable gigabytes at the moment ffmpeg was refused a hundred
+    megabytes.
+    """
+    return {"commit": _gb(committed()), "free": _gb(headroom())}
