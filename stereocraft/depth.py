@@ -101,6 +101,40 @@ def checkpoint(model):
     return DA3_MODEL if model == "da3" else MODELS[model]
 
 
+def _one_image_at_a_time(model):
+    """Stop DA3 building a thread pool for every single frame.
+
+    Its input processor farms the per-image work out to a `ThreadPool` of eight
+    workers, created and torn down on each call.  For a batch of photographs that
+    is sensible; this app hands it exactly one image at a time, so the pool never
+    has anything to parallelise and exists only to be built and destroyed.
+
+    **And on Windows, building and destroying it is not free.**  The threads are
+    joined properly -- the count does not climb -- but the commit charge does:
+    measured at 3.69 MB leaked per call, against 0.00 with the same work done
+    sequentially.  Per frame that is nothing.  Over the thirty thousand frames of
+    a long clip it is eighty-six gigabytes of memory the process has asked the
+    system to promise and will never use, and a machine hits its commit limit
+    and starts refusing allocations long before the end.  What that looks like
+    from the outside is ffmpeg dying on a frame nine hours in, having encoded
+    twenty-three thousand of them perfectly well -- which is what sent this
+    conversion, and the search for the cause, a very long way in the wrong
+    direction.
+
+    Sequential is also simply the right call for one image: it is the same work
+    without eight threads being started to watch one of them do it.
+    """
+    processor = getattr(model, "input_processor", None)
+    if processor is None:  # a DA3 that no longer works this way; nothing to do
+        return
+
+    def one_at_a_time(*args, **kwargs):
+        kwargs.setdefault("sequential", True)
+        return processor(*args, **kwargs)
+
+    model.input_processor = one_at_a_time
+
+
 def dtype_for(device):
     """fp16 halves the memory traffic on a GPU and is indistinguishable here;
     CPU stays fp32.  `budget` prices the other device with this too, so an
@@ -206,7 +240,9 @@ class DepthEstimator:
                 sys.modules[name] = stub
         from depth_anything_3.api import DepthAnything3  # heavy; import on demand
 
-        return DepthAnything3.from_pretrained(checkpoint("da3")).to(self.device).eval()
+        model = DepthAnything3.from_pretrained(checkpoint("da3")).to(self.device).eval()
+        _one_image_at_a_time(model)
+        return model
 
     def _load_da2(self):
         from transformers import AutoModelForDepthEstimation  # heavy; import on demand

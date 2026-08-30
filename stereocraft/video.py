@@ -73,6 +73,11 @@ SCENE_CUT = 0.35
 # in the trail a killed process leaves behind, rare enough that an hour of
 # conversion is a page rather than a book.
 HEARTBEAT = 200
+# Video memory the caching allocator may sit on unused before it is asked for it
+# back.  Some slack is the whole point of a caching allocator -- handing every
+# block back would mean asking the driver for it again next frame -- so this is
+# well above the churn of one frame and well below the pool a big one leaves.
+CUDA_SLACK = 2_000_000_000
 
 
 class MissingFFmpeg(Exception):
@@ -573,6 +578,32 @@ def _fall_back_to_cpu(converter):
     return True
 
 
+def _release(device):
+    """Hand back the video memory the allocator is holding but not using.
+
+    **On Windows this is not housekeeping; it is the difference between fitting
+    and not.**  The display driver keeps a system-memory backing store for every
+    byte of video memory a process reserves, so PyTorch's caching pool is
+    charged to host commit as well as to the card -- and that pool only ever
+    grows, settling at the high-water mark of the largest thing it ever held.
+
+    Measured on the machine this failed on: 8 GB reserved on the card cost
+    9.37 GB of host commit with the resident set still at 0.66 GB, and giving it
+    back brought the commit to 1.46 GB.  A conversion that had peaked once at
+    ten gigabytes of video memory therefore went on asking the system to promise
+    about seven it had no further use for -- for the remaining four hours, on a
+    machine with 31 GB, beside an encoder wanting five and a half of its own.
+
+    At the heartbeat rather than every frame: the pool refills from the next
+    allocation, so paying for it constantly would be a real cost for no further
+    gain, while once every couple of hundred frames is nothing.
+    """
+    if device.type != "cuda":
+        return
+    if torch.cuda.memory_reserved() - torch.cuda.memory_allocated() > CUDA_SLACK:
+        torch.cuda.empty_cache()
+
+
 def _squeeze(eye, width, height):
     """Resize one eye view to its place in the finished frame.
 
@@ -681,6 +712,10 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
     # add, and `_remux` makes `out` from it; see `_encoder` for why the two
     # cannot be one pass.  With no sound there is nothing to add and the encoder
     # writes the finished file directly.
+    # The passes above peak far higher than the render does -- the upscaler alone
+    # is nine gigabytes of card -- and every byte still reserved is a byte of
+    # host commit the render does not need.  See `_release`.
+    _release(converter.depth_model.device)
     sound = wants_sound(clip, cfg)
     picture = out.with_name(f"{out.stem}.picture{out.suffix}") if sound else out
     _warn_if_full(cfg, src.name, geo)
@@ -752,13 +787,15 @@ def convert_video(src, dst=None, converter=None, on_progress=None, on_frame=None
                         # The encoder as well as ourselves.  It is a separate
                         # process and it is the one that ran out of memory, so
                         # measuring only this side is measuring the wrong half.
+                        _release(converter.depth_model.device)
                         enc_rss, enc_commit = logbook.process_memory(encoder.pid)
                         logbook.note("rendering", frame=done, of=clip.frames,
                                      **logbook.usage(),
                                      rss=logbook._gb(current), peak=logbook._gb(peak),
                                      enc=logbook._gb(enc_rss),
                                      enc_commit=logbook._gb(enc_commit),
-                                     **({"cuda": logbook._gb(card[0])} if card else {}))
+                                     **({"cuda": logbook._gb(card[0]),
+                                         "cuda_held": logbook._gb(card[1])} if card else {}))
                     if on_progress and on_progress(done, clip.frames, time.perf_counter() - started) is False:
                         cancelled = True
                         break

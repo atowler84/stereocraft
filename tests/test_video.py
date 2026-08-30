@@ -401,3 +401,43 @@ class TestItSaysSoBeforeTheWaitRatherThanAfter:
     def test_an_8k_frame_wants_more_than_a_1080p_one(self):
         assert (video._headroom_wanted(self._Geo(8192, 4096))
                 > 2 * video._headroom_wanted(self._Geo(1920, 1080)))
+
+
+class TestVideoMemoryIsChargedToTheHostToo:
+    """On Windows the display driver keeps a system-memory backing store for
+    every byte of video memory a process reserves, so PyTorch's caching pool is
+    paid for twice: once on the card and once in host commit.  Measured on the
+    machine a conversion died on -- 8 GB reserved cost 9.37 GB of commit with
+    0.66 GB resident, and handing it back cost 1.46 GB.  The pool only grows, so
+    one big pass early leaves the whole of the rest of the clip paying for it."""
+
+    class _Device:
+        def __init__(self, kind):
+            self.type = kind
+
+    def _torch(self, monkeypatch, reserved, allocated):
+        freed = []
+        cuda = type("cuda", (), {
+            "memory_reserved": staticmethod(lambda: reserved),
+            "memory_allocated": staticmethod(lambda: allocated),
+            "empty_cache": staticmethod(lambda: freed.append(True)),
+        })
+        monkeypatch.setattr(video.torch, "cuda", cuda)
+        return freed
+
+    def test_a_pool_sitting_on_far_more_than_it_uses_is_handed_back(self, monkeypatch):
+        freed = self._torch(monkeypatch, 10_000_000_000, 2_000_000_000)
+        video._release(self._Device("cuda"))
+        assert freed
+
+    def test_but_ordinary_slack_is_left_alone(self, monkeypatch):
+        """Handing back every block would mean asking the driver for it again
+        next frame, which is the cost a caching allocator exists to avoid."""
+        freed = self._torch(monkeypatch, 2_500_000_000, 2_000_000_000)
+        video._release(self._Device("cuda"))
+        assert not freed
+
+    def test_and_a_cpu_conversion_is_not_asked_at_all(self, monkeypatch):
+        freed = self._torch(monkeypatch, 10_000_000_000, 0)
+        video._release(self._Device("cpu"))
+        assert not freed

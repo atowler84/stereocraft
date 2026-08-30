@@ -411,7 +411,13 @@ def cuda_memory():
     try:
         if not torch.cuda.is_available():
             return None
-        return torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()
+        # Reserved rather than only allocated, because reserved is the one that
+        # costs.  On Windows the display driver keeps a system-memory backing
+        # store for every byte of video memory a process reserves, so the
+        # caching allocator's pool is charged to the host as well as the card --
+        # see `video._release`.
+        return (torch.cuda.memory_allocated(), torch.cuda.memory_reserved(),
+                torch.cuda.max_memory_allocated())
     except Exception:
         return None
 
@@ -450,7 +456,8 @@ def stage(name, **fields):
         card = cuda_memory()
         note(f"{name} done", took=f"{time.perf_counter() - started:.1f}s",
              **usage(), rss=_gb(current), peak=_gb(peak),
-             **({"cuda": _gb(card[0]), "cuda_peak": _gb(card[1])} if card else {}))
+             **({"cuda": _gb(card[0]), "cuda_held": _gb(card[1]),
+                 "cuda_peak": _gb(card[2])} if card else {}))
 
 
 def usage():
