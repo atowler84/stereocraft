@@ -218,3 +218,60 @@ class TestVideo:
         result = video.convert_video(clip, out, converter,
                                      on_progress=lambda done, total, secs: done < 5)
         assert result is None and not out.exists()
+
+
+class TestLettingGoOfTheCard:
+    """What a paused run puts down, and what picks it back up.
+
+    The point of the method is memory, which a test cannot assert on a machine
+    with no card in it -- so what is checked here is the part that has to be
+    true either way: the model goes, and comes back when something asks.
+    """
+
+    @staticmethod
+    def fake(monkeypatch):
+        from types import SimpleNamespace
+        from stereocraft import pipeline
+
+        built = []
+
+        def estimator(model, device):
+            built.append(model)
+            return SimpleNamespace(name=model, device=torch.device("cpu"))
+
+        monkeypatch.setattr(pipeline, "DepthEstimator", estimator)
+        return built
+
+    def test_the_model_is_put_down(self, monkeypatch):
+        from stereocraft.pipeline import Converter
+
+        built = self.fake(monkeypatch)
+        converter = Converter(Settings())
+        converter.depth_model
+        assert built == ["da3"]
+        converter.let_go()
+        assert converter._depth is None
+
+    def test_and_built_again_by_whatever_asks_next(self, monkeypatch):
+        """Nothing puts it back, which is the point: the frame that needs it is
+        what pays for it, and a run that was stopped rather than resumed never
+        pays at all."""
+        from stereocraft.pipeline import Converter
+
+        built = self.fake(monkeypatch)
+        converter = Converter(Settings())
+        converter.depth_model
+        converter.let_go()
+        assert converter.depth_model.name == "da3"
+        assert built == ["da3", "da3"]
+
+    def test_it_says_how_much_came_back(self, monkeypatch):
+        from stereocraft.pipeline import Converter
+
+        self.fake(monkeypatch)
+        converter = Converter(Settings())
+        converter.depth_model
+        freed = converter.let_go()
+        # Zero on a machine with no card, which is the honest answer there.
+        assert freed >= 0
+        assert freed == 0 or torch.cuda.is_available()

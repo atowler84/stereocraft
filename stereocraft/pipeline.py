@@ -1,5 +1,6 @@
 """The whole pipeline: photo in, side-by-side 3D photo out."""
 
+import gc
 import sys
 import time
 from dataclasses import dataclass
@@ -435,6 +436,52 @@ class Converter:
         if self._depth is None or self._depth.name != self.settings.model:
             self._depth = DepthEstimator(self.settings.model, self.settings.device)
         return self._depth
+
+    def let_go(self):
+        """Put down everything on the card that can be picked up again.
+
+        For a pause, which is someone asking for their machine back.  A paused
+        run is idle, so what it is holding is memory rather than work, and
+        almost all of that can be given up and taken again in a couple of
+        seconds.
+
+        Measured on a 4080 SUPER, paused mid-render on a 1080p clip with the
+        metric model: 5784 MB reserved before, 142 MB after, of which 67 MB is
+        the frames in flight.  Three gigabytes of that was the allocator's own
+        cache and 1.3 GB the weights.  Paused between the chunks of an upscale
+        pass it is starker -- 13848 MB reserved against 47 MB actually live, all
+        the rest being cache the pass will ask the pool for again; that one
+        settles at 1722 MB rather than 142 because the little that is live is
+        scattered through segments the pool cannot then hand back whole.
+
+        There is nothing else worth chasing.  A plate keeps its store off the
+        card by design and brings across one shot at a time, so the surround is
+        25 MB whether the clip has three cuts in it or a hundred -- see
+        `plate.to`, which is where that decision was already made.
+
+        The collection is not housekeeping.  The estimator sits in a reference
+        cycle, and measured without this the weights were still on the card
+        after `empty_cache` and went back on nobody's timetable.
+
+        What cannot be given back is the CUDA context -- 291 MB on the same
+        machine -- which goes when the process does and not before.
+
+        Nothing needs putting back afterwards: `depth_model` builds again for
+        the frame that next asks for one, from the same file and to the same
+        weights.  Paused and resumed this way, a render and an upscale pass both
+        wrote byte for byte the file they wrote running straight through.  And if something else
+        has taken the card in the meantime, the rebuild raises where the render
+        already catches it and the clip finishes slowly on the CPU -- which is a
+        pause costing time, rather than a pause costing the work.
+        """
+        cuda = torch.cuda.is_available()
+        held = torch.cuda.memory_reserved() if cuda else 0
+        self._depth = None
+        gc.collect()
+        if not cuda:
+            return 0
+        torch.cuda.empty_cache()
+        return held - torch.cuda.memory_reserved()
 
     def convert(self, src, dst=None):
         """Convert one photo.

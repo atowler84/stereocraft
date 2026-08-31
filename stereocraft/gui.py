@@ -168,6 +168,12 @@ class App:
         self.states = []  # one ("state", "detail") per file, in step with it
         self.running = False
         self.cancel = threading.Event()
+        # Set means carry on, so a pause is this being cleared and the worker
+        # waiting on it.  An event rather than a flag because the waiting has to
+        # cost nothing: a paused run holds no lock and burns no CPU.
+        self.carry_on = threading.Event()
+        self.carry_on.set()
+        self.paused_status = ""  # what the status line said before it was paused
         # What the sliders would say if nobody had touched them, which depends on
         # what is in the queue; see `_sync_recommendation`.
         self.recommended = RECOMMENDED[False]
@@ -209,19 +215,28 @@ class App:
 
         footer = ttk.Frame(frame)
         footer.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        footer.columnconfigure(2, weight=1)
+        footer.columnconfigure(3, weight=1)
         self.convert_button = ttk.Button(footer, text="Convert", command=self.start)
         self.convert_button.grid(row=0, column=0)
+        # Stopping a clip throws away every frame of it, and an hour in that is
+        # a high price for wanting the machine back for ten minutes.  Pausing is
+        # the cheap version of the same wish, so it stands beside Stop rather
+        # than making Stop the only way out.  Its width is fixed at the longer
+        # of the two words it shows, so that pressing it does not shove Stop and
+        # the bar sideways.
+        self.pause_button = ttk.Button(footer, text="Pause", width=8,
+                                       command=self.toggle_pause)
+        self.pause_button.grid(row=0, column=1, padx=(6, 0))
         # A photo is over before anyone could ask for it back; a clip runs for
         # minutes, so there has to be a way out of one.
         self.stop_button = ttk.Button(footer, text="Stop", command=self.stop)
-        self.stop_button.grid(row=0, column=1, padx=(6, 0))
+        self.stop_button.grid(row=0, column=2, padx=(6, 0))
         self.progress = ttk.Progressbar(footer, mode="determinate")
-        self.progress.grid(row=0, column=2, sticky="ew", padx=8)
+        self.progress.grid(row=0, column=3, sticky="ew", padx=8)
         self.progress_percent = ttk.Label(footer, text="0%", width=5, anchor="e")
-        self.progress_percent.grid(row=0, column=3, sticky="e")
+        self.progress_percent.grid(row=0, column=4, sticky="e")
         self.status = ttk.Label(footer, text="Add a photo or a video to begin")
-        self.status.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.status.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
         # Every setting a Reset would put back.  Watching all of them is what
         # tells each tab's button whether it has anything left to undo, and the
@@ -802,6 +817,8 @@ class App:
             (self.clear_button, idle and bool(self.files)),
             *((button, not at_default()) for button, at_default in self._resets),
             (self.stop_button, self.running and not self.cancel.is_set()),
+            # Still yours while paused -- it is the only way back out of one.
+            (self.pause_button, self.running and not self.cancel.is_set()),
             # The eyes and the focus are yours only when the scene is not
             # setting them; the Depth sliders are the other way round, being
             # what matching the scene aims for.  And they are percentages of
@@ -815,6 +832,9 @@ class App:
             (self.quality_scale, self.fmt.get() != "png"),
         ):
             button.state(["!disabled"] if usable else ["disabled"])
+        # Asked of the event rather than remembered separately, so the button
+        # cannot come to disagree with what the worker is actually doing.
+        self.pause_button.config(text="Pause" if self.carry_on.is_set() else "Resume")
 
     def _set_progress(self, value, maximum=None):
         """The bar and the number beside it, which only ever move together."""
@@ -853,6 +873,7 @@ class App:
         self.running = True
         self.cross_used = self.cross.get()
         self.cancel.clear()
+        self.carry_on.set()
         self.finished = 0
         self.errors = []
         self.notices = []
@@ -889,8 +910,59 @@ class App:
         """Ask the run to stop.  A clip gives up on the frame it is on and leaves
         no half-written file; a batch of photos stops after the one in hand."""
         self.cancel.set()
+        # A paused run is asleep in `_hold` and would never see this; letting it
+        # go is what turns Stop-while-paused into a stop rather than a hang.
+        self.carry_on.set()
         self.status.config(text="Stopping...")
         self._refresh_controls()
+
+    def toggle_pause(self):
+        """Hold the run where it stands, or let it carry on.
+
+        A pause takes effect at the next frame rather than at once -- the frame
+        in hand is finished and written first, which is what makes resuming free
+        and leaves the encoder a clip it can still finish.  So the button says
+        what has been asked for and the worker says when it has happened.
+        """
+        if self.carry_on.is_set():
+            self.paused_status = self.status.cget("text")
+            self.carry_on.clear()
+            self.status.config(text="Pausing...")
+        else:
+            self.carry_on.set()
+            # Put back here as well as on the worker's word, for the resume that
+            # comes before the worker has even noticed the pause: there is no
+            # "carrying on" to report, and "Pausing..." would sit there for the
+            # rest of the clip.
+            self.status.config(text=self.paused_status or "Converting...")
+        self._refresh_controls()
+
+    def _hold(self):
+        """Wait here while the run is paused.  Runs on the worker thread.
+
+        Called from the progress callbacks, which is the one moment a conversion
+        is between frames: the encoder has everything it has been given and the
+        decoder is blocked on a full pipe, so both sit there for as long as this
+        does and neither minds.  The card is handed back before the wait rather
+        than held through it -- see `Converter.let_go`, which is where the
+        measurements are and why taking it again costs a couple of seconds and
+        not a frame of the picture.
+
+        Returns how long it waited, which the caller takes off the clock it is
+        estimating from: an hour paused is not an hour of slow conversion, and
+        the time left would otherwise read as though it were.
+        """
+        if self.carry_on.is_set():
+            return 0.0
+        began = time.monotonic()
+        freed = self.converter.let_go()
+        logbook.note("paused", freed=logbook._gb(freed))
+        self.events.put(("paused", freed))
+        self.carry_on.wait()
+        waited = time.monotonic() - began
+        logbook.note("resumed", after=f"{waited:.0f}s")
+        self.events.put(("resumed", None))
+        return waited
 
     def _notice(self, message):
         """Something the run needs to say that is not the result.
@@ -920,6 +992,9 @@ class App:
                 self.events.put(("error", (None, f"Could not load the depth model: {error}")))
                 return
             for index, path in enumerate(files):
+                # Between files, which is where a batch of photos waits: one
+                # photo is over long before anybody could pause it.
+                self._hold()
                 if self.cancel.is_set():
                     self.events.put(("stopped", index))
                     continue
@@ -960,33 +1035,40 @@ class App:
             if self.cancel.is_set():
                 return False
             now = time.monotonic()
-            if done and total and now - last[0] < 0.3:
-                return True
-            last[0] = now
-            share = f" {done}/{total}" if total else ""
-            self.events.put(("stage", (index, f"{label}{share}",
-                                       done / total if (done and total) else None)))
-            return True
+            if not (done and total and now - last[0] < 0.3):
+                last[0] = now
+                share = f" {done}/{total}" if total else ""
+                self.events.put(("stage", (index, f"{label}{share}",
+                                           done / total if (done and total) else None)))
+            # Held after the row has been brought up to date, so what it shows
+            # through a pause is where the pass actually stopped; and asked
+            # again afterwards, because Stop is what a pause often turns into.
+            self._hold()
+            return not self.cancel.is_set()
 
         return report
 
     def _progress(self, index):
         """Report a clip's frames back to the window, and carry the Stop button's
         answer back to the conversion."""
-        warm = 0.0
+        warm, held = 0.0, 0.0
 
         def report(done, total, seconds):
-            nonlocal warm
+            nonlocal warm, held
             if self.cancel.is_set():
                 return False
             # The first frame carries the graphics driver's warm-up with it, and
             # charging the whole clip for it makes the opening estimate nonsense.
             if done == 1:
                 warm = seconds
-            rate = (done - 1) / (seconds - warm) if done > 1 and seconds > warm else 0
+            # Time paused comes off the same way the warm-up does: neither was
+            # spent converting, and either one left in makes the estimate wrong.
+            spent = seconds - warm - held
+            rate = (done - 1) / spent if done > 1 and spent > 0 else 0
             left = clock((total - done) / rate) if rate and total > done else ""
             self.events.put(("frame", (index, done, total, left)))
-            return True
+            held += self._hold()
+            return not self.cancel.is_set()
 
         return report
 
@@ -1058,6 +1140,15 @@ class App:
                 # fraction of a file at a time rather than jumping at the end.
                 if total:
                     self._set_progress(self.finished + done / total)
+            elif kind == "paused":
+                # The worker has reached a frame boundary and stopped there,
+                # which is a different thing from the button having been pressed.
+                # What it gave back is worth saying: someone who paused to get
+                # the card for something else wants to know they have it.
+                gave = f" ({payload / 2 ** 30:.1f} GB of the card given back)" if payload else ""
+                self.status.config(text=f"Paused - press Resume to carry on{gave}")
+            elif kind == "resumed":
+                self.status.config(text=self.paused_status or "Converting...")
             elif kind == "preview":
                 from PIL import ImageTk
 
@@ -1110,6 +1201,10 @@ class App:
                 if self.cancel.is_set():
                     self.status.config(text="Stopped")
                 self.cancel.clear()
+                # A pause asked for after the last frame of the last file never
+                # reached a `_hold`, and would otherwise still be sitting on the
+                # button when the next run started.
+                self.carry_on.set()
                 self._refresh_controls()
                 self._report(self.errors, self.notices)
         self.root.after(100, self._drain)

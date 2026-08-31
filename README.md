@@ -382,6 +382,37 @@ rewrites a line with the frame count and an estimate; the window shows the frame
 it is working on and counts the queue down. Either can be stopped part-way, and
 neither leaves a half-written file behind.
 
+Stopping an hour into a clip throws away the hour, though, which is a high price
+for wanting the machine back for ten minutes. So the window also has Pause. It
+takes effect at the end of the frame in hand rather than at once -- the frame is
+finished and written, and the decoder and the encoder sit blocked on their pipes
+until Resume, which is why carrying on costs nothing and lands exactly where it
+left off. The passes that run before the conversion pause the same way. Time
+spent paused is taken off the estimate rather than counted as slow work.
+
+A pause hands back the card as well as the CPU. Nothing is running, so what a
+paused conversion holds is memory rather than work, and nearly all of it can be
+given up: the allocator's cache goes back to the driver and the depth model is
+put down, to be built again for the frame that next asks for one. Measured on a
+4080 SUPER:
+
+| Paused during | Reserved | After | Actually live |
+|---|---|---|---|
+| a 1080p render | 5784 MB | 142 MB | 67 MB |
+| an upscale pass | 13848 MB | 1722 MB | 47 MB |
+
+The upscale row is the starker one, and the reason that pass is worth pausing at
+all: the pause lands between chunks, so everything the last chunk used is cache
+by then and goes straight back. It settles at 1722 MB rather than 142 because
+the little that is still live sits scattered through segments the pool cannot
+hand back whole. Through the window, with the depth model loaded beside it, a
+paused upscale pass handed back 14.2 GB and sat at 1500 MB.
+
+Coming back costs the model reload, 1.7 to 3.1 seconds. The output does not
+change: paused and resumed, both a render and an upscale pass wrote byte for
+byte the file they wrote running straight through. The one thing that cannot be
+handed back is the CUDA context, 291 MB, which goes when the app does.
+
 ## Which settings?
 
 None of them, most of the time: press Convert.

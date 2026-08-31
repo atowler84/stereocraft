@@ -5,6 +5,7 @@ does need a display, so the whole file steps aside where there is not one.
 """
 
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -513,3 +514,170 @@ class TestTheQueue:
         app.tabs.select(0)
         queued(app, monkeypatch, "clip.mp4")
         assert app.tabs.tab(app.tabs.select(), "text") == "General"
+
+
+class TestPause:
+    """Holding a run where it stands, and letting it carry on from there.
+
+    The worker thread is the thing being tested: every one of these puts a
+    callback on a thread of its own, because the whole point of a pause is that
+    it blocks the conversion and not the window.
+    """
+
+    @staticmethod
+    def waited(check, seconds=2.0):
+        """Give the worker thread a moment to reach where it is going."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if check():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def held(self, app, call):
+        """Run `call` on a worker thread and hand back what it returns."""
+        answer = []
+        thread = threading.Thread(target=lambda: answer.append(call()), daemon=True)
+        thread.start()
+        return thread, answer
+
+    def test_the_button_says_which_way_it_goes(self, app, monkeypatch):
+        queued(app, monkeypatch, "clip.mp4")
+        app.running = True
+        app._refresh_controls()
+        assert app.pause_button.cget("text") == "Pause"
+        app.toggle_pause()
+        assert app.pause_button.cget("text") == "Resume"
+        app.toggle_pause()
+        assert app.pause_button.cget("text") == "Pause"
+
+    def test_a_paused_run_stops_at_the_next_frame_and_waits(self, app, monkeypatch):
+        queued(app, monkeypatch, "clip.mp4")
+        app.running = True
+        app.toggle_pause()
+        report = app._progress(0)
+        thread, answer = self.held(app, lambda: report(10, 300, 30.0))
+        # The frame it had in hand is reported before it settles down to wait.
+        assert self.waited(lambda: not app.events.empty())
+        assert not answer, "the callback returned instead of waiting"
+        app.toggle_pause()
+        thread.join(2)
+        assert answer == [True]  # and the conversion carries on where it was
+
+    def test_stop_while_paused_is_a_stop(self, app, monkeypatch):
+        """Otherwise the run is asleep with nothing left to wake it."""
+        queued(app, monkeypatch, "clip.mp4")
+        app.running = True
+        app.toggle_pause()
+        report = app._progress(0)
+        thread, answer = self.held(app, lambda: report(10, 300, 30.0))
+        assert self.waited(lambda: not app.events.empty())
+        app.stop()
+        thread.join(2)
+        assert answer == [False]
+
+    def test_the_passes_before_a_conversion_pause_too(self, app, monkeypatch):
+        """Adding detail and smoothing take minutes each -- longer than the
+        conversion they run before, and just as worth pausing."""
+        queued(app, monkeypatch, "clip.mp4")
+        app.running = True
+        app.toggle_pause()
+        stage = app._stage(0)
+        thread, answer = self.held(app, lambda: stage("adding detail", 5, 300))
+        assert self.waited(lambda: not app.events.empty())
+        assert not answer
+        app.toggle_pause()
+        thread.join(2)
+        assert answer == [True]
+
+    def test_a_batch_of_photos_waits_between_files(self, app, monkeypatch, tmp_path):
+        """A photo is over before anyone could pause it, so the wait is between
+        one and the next."""
+        done, released = [], []
+        app.converter = SimpleNamespace(settings=None, depth_model=None,
+                                        let_go=lambda: released.append(1) or 0,
+                                        convert=lambda path, out: done.append(path))
+        app.carry_on.clear()
+        files = [tmp_path / "one.jpg", tmp_path / "two.jpg"]
+        thread = threading.Thread(target=app._work,
+                                  args=(files, None, (SimpleNamespace(), SimpleNamespace())),
+                                  daemon=True)
+        thread.start()
+        assert self.waited(lambda: not app.events.empty())
+        assert done == [], "it converted a file it had been asked to hold before"
+        app.carry_on.set()
+        thread.join(2)
+        assert done == files
+        assert released, "it sat on the card through the wait"
+
+    def test_the_card_is_handed_back_before_the_wait(self, app, monkeypatch):
+        """Not after it: the whole reason to pause is that something else wants
+        the machine now."""
+        queued(app, monkeypatch, "clip.mp4")
+        app.running = True
+        order = []
+        app.converter = SimpleNamespace(let_go=lambda: order.append("let go") or 4 * 2 ** 30)
+        app.toggle_pause()
+        report = app._progress(0)
+        thread, answer = self.held(app, lambda: report(10, 300, 30.0))
+        assert self.waited(lambda: order == ["let go"])
+        app._drain()
+        assert "4.0 GB of the card given back" in app.status.cget("text")
+        app.toggle_pause()
+        thread.join(2)
+        assert order == ["let go"], "it let go more than once for one pause"
+
+    def test_a_run_that_is_not_paused_keeps_what_it_has(self, app, monkeypatch):
+        """`_hold` is called at every frame of every clip; the one that is not
+        paused must not go near the card."""
+        app.converter = SimpleNamespace(
+            let_go=lambda: pytest.fail("it dropped the model on an ordinary frame"))
+        assert app._hold() == 0.0
+
+    def test_time_paused_is_not_time_converting(self, app, monkeypatch):
+        """An hour paused would otherwise read as an hour of very slow work, and
+        the time left as the rest of the night."""
+        queued(app, monkeypatch, "clip.mp4")
+        monkeypatch.setattr(app, "_hold", lambda: 10.0)  # ten seconds of pause
+        report = app._progress(0)
+        report(1, 100, 1.0)  # the first frame carries the warm-up, then the pause
+        report(2, 100, 12.0)  # one second of actual work since
+        app._drain()
+        # A frame a second with 98 to go.  Counting the pause as work would make
+        # it a frame every eleven seconds, and the answer eighteen minutes.
+        assert "1m38s left" in app.rows[0].detail.cget("text")
+
+    def test_the_status_line_goes_back_to_what_it_was(self, app, monkeypatch):
+        queued(app, monkeypatch, "clip.mp4")
+        app.running = True
+        app.status.config(text="Converting clip.mp4 (1/1)")
+        app.toggle_pause()
+        assert app.status.cget("text") == "Pausing..."
+        app.events.put(("paused", None))
+        app._drain()
+        assert "Paused" in app.status.cget("text")
+        app.toggle_pause()
+        app.events.put(("resumed", None))
+        app._drain()
+        assert app.status.cget("text") == "Converting clip.mp4 (1/1)"
+
+    def test_resuming_before_it_took_hold_still_tidies_the_line(self, app, monkeypatch):
+        """Pressing Pause and then Resume between two frames means the worker
+        never saw either, so nothing arrives to take "Pausing..." back off."""
+        queued(app, monkeypatch, "clip.mp4")
+        app.running = True
+        app.status.config(text="Converting clip.mp4 (1/1)")
+        app.toggle_pause()
+        app.toggle_pause()
+        assert app.status.cget("text") == "Converting clip.mp4 (1/1)"
+
+    def test_a_run_never_finishes_still_paused(self, app, monkeypatch):
+        """The last frame of the last file can go by after the button was
+        pressed and before anything reached a wait."""
+        queued(app, monkeypatch, "clip.mp4")
+        app.running = True
+        app.toggle_pause()
+        app.events.put(("finished", None))
+        app._drain()
+        assert app.carry_on.is_set()
+        assert app.pause_button.cget("text") == "Pause"
