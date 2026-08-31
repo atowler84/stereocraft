@@ -2,7 +2,7 @@
 
 import pytest
 
-from stereocraft import cli
+from stereocraft import cli, vr180
 from stereocraft.pipeline import SBS_TAGS, Settings, VideoSettings, output_path, tag
 
 
@@ -26,6 +26,53 @@ class TestRetiredFlags:
     def test_main_refuses_rather_than_guessing(self, capsys):
         assert cli.main(["--disparity", "2", "x.jpg"]) == 2
         assert "--eyes" in capsys.readouterr().err
+
+
+class TestMisdirectedFlags:
+    """--target and --limit are percentages of frame width, and the spherical
+    path does not think in those.  They used to be accepted and ignored, which
+    is the one answer a settings flag must never give."""
+
+    @pytest.mark.parametrize("flag,replacement", [("--target", "--target-deg"),
+                                                  ("--limit", "--limit-deg")])
+    def test_say_what_to_use_instead(self, flag, replacement):
+        message = cli.misdirected(parse("--projection", "vr180", flag, "2", "x.jpg"))
+        assert message and replacement in message
+
+    def test_a_flat_pair_is_where_a_percentage_belongs(self):
+        assert cli.misdirected(parse("--target", "2", "x.jpg")) is None
+        assert cli.misdirected(parse("--limit", "3", "x.jpg")) is None
+
+    def test_silent_when_neither_is_given(self):
+        assert cli.misdirected(parse("--projection", "vr180", "x.jpg")) is None
+
+    def test_main_refuses_rather_than_ignoring(self, capsys):
+        assert cli.main(["--projection", "vr180", "-t", "2", "x.jpg"]) == 2
+        assert "--target-deg" in capsys.readouterr().err
+
+
+class TestDegreeFlags:
+    """The spherical pair, which is what `--target` hands over to."""
+
+    def test_they_default_to_what_vr180_asks_for(self):
+        s = cli.settings_for(parse("--projection", "vr180", "x.jpg"), video=False)
+        assert s.target_deg == vr180.TARGET_DEG and s.limit_deg == vr180.LIMIT_DEG
+
+    def test_they_reach_the_settings(self):
+        s = cli.settings_for(parse("--projection", "vr180", "--target-deg", "1.4",
+                                   "--limit-deg", "2.5", "x.jpg"), video=False)
+        assert s.target_deg == 1.4 and s.limit_deg == 2.5
+
+    def test_a_clip_gets_them_too(self):
+        s = cli.settings_for(parse("--projection", "vr180", "--target-deg", "0.9", "x.mp4"),
+                             video=True)
+        assert s.target_deg == 0.9
+
+    def test_the_percentage_pair_still_defaults_without_being_given(self):
+        """`--limit` lost its literal default so that "was it given?" can be
+        asked; the setting it feeds must not have lost it too."""
+        assert cli.settings_for(parse("x.jpg"), video=False).limit_pct == Settings.limit_pct
+        assert cli.settings_for(parse("--limit", "2", "x.jpg"), video=False).limit_pct == 2.0
 
 
 class TestNumber:

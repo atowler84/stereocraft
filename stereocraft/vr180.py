@@ -187,16 +187,35 @@ def video_cap(fps):
     return VIDEO_CAPS[-1][1]
 
 
-def natural_size(width, focal_px):
+def natural_size(focal_px):
     """The per-eye square that would keep this source's own detail exactly.
 
     Giving the sphere the pixels per degree the source had, which for a
-    65-degree lens is a square nearly three times its width and for a 49-degree
-    one four times.  Not what the frame is written at -- see `patch` -- but what
-    says whether a source has the detail to fill one: a 720-wide clip wants 1980
-    and a ceiling of 4096 will be half empty of anything it can offer.
+    65-degree lens is a square nearly two and a half times its width.  Not what
+    the frame is written at -- see `patch` -- but what says whether a source has
+    the detail to fill one: a 720-wide clip wants 1759 and a ceiling of 4096
+    will be well over half empty of anything it can offer.
+
+    **Measured at the centre of the frame, which is the number that used to be
+    wrong.**  A pinhole does not spread its pixels evenly over the field it
+    covers: the density rises as `sec^2` towards the edges, so the far corners
+    of a wide frame carry half again as many pixels per degree as the middle
+    does.  This was `width * FOV / fov(focal_px, width)`, which is the density
+    *averaged across the width* -- a number no part of the picture actually
+    offers, and one the periphery flatters.  A 1280-wide frame through a 28mm
+    lens averages 19.6 pixels a degree and offers 17.4 in the middle, so it was
+    judged able to fill 3519 of a 4096 ceiling where the part anyone is looking
+    at fills 3128.  That is the difference between clearing
+    `prepass.WORTH_UPSCALING` and not, and 720p landscape cleared it by 1% --
+    so the upscaler declined footage that was being enlarged 1.31x in the centre
+    of frame, on the strength of detail sitting out at the edges.
+
+    The centre is the conservative reading and the one that describes where the
+    subject is.  It is also what the old expression converges to as the lens
+    narrows and the `sec^2` spread flattens out, so nothing changes for the
+    long lenses; it is the wide ones that were being over-credited.
     """
-    return width * FOV / fov(focal_px, width)
+    return math.radians(FOV) * float(focal_px)
 
 
 def patch(focal_px, src_w, src_h, cap=MAX_SIZE, size=None):
@@ -220,8 +239,8 @@ def patch(focal_px, src_w, src_h, cap=MAX_SIZE, size=None):
     return Patch(FOV, FOV, side, side)
 
 
-def auto_target(spot):
-    """`TARGET_DEG` restated as the percentage of frame width that
+def auto_target(spot, target_deg=TARGET_DEG):
+    """`target_deg` restated as the percentage of frame width that
     `stereo.auto_geometry` takes, so that one piece of scene-fitting logic serves
     both projections instead of two that can drift apart.
 
@@ -230,8 +249,13 @@ def auto_target(spot):
     is ever less than the whole 180 degrees, the same share is a different angle.
     Pinned at 180, a 65-degree frame once came out with under half the separation
     it had asked for and looked merely flat rather than wrong.
+
+    `target_deg` is a parameter rather than the constant it reads by default
+    because `TARGET_DEG` is the one number in this file arrived at by reasoning
+    rather than by measurement, and the caller has to be able to disagree with
+    it -- see `Settings.target_deg`.
     """
-    return 100.0 * TARGET_DEG / spot.span_az
+    return 100.0 * target_deg / spot.span_az
 
 
 def _elevation(top, rows, spot, device, dtype):

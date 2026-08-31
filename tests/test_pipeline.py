@@ -166,7 +166,32 @@ class TestVr180:
         from stereocraft import vr180
         info = self.convert(converter, photo, tmp_path / "vr.jpg")
         assert info["patch"].width == Settings.vr180_cap
-        assert vr180.natural_size(320, 320 * 28 / 36) < info["patch"].width, "and it is short"
+        assert vr180.natural_size(320 * 28 / 36) < info["patch"].width, "and it is short"
+
+    def test_the_depth_setting_reaches_the_sphere(self, converter, photo, tmp_path):
+        """`--target` is a percentage of frame width and means nothing here, so
+        the spherical path reads `target_deg` -- and used to read neither, taking
+        `vr180.TARGET_DEG` whatever the caller asked for.  The separation is what
+        proves it arrived: the baseline `auto` settles on has to scale with it.
+        """
+        gentle = self.convert(converter, photo, tmp_path / "a.jpg", vr180_size=192,
+                              target_deg=0.4)
+        strong = self.convert(converter, photo, tmp_path / "b.jpg", vr180_size=192,
+                              target_deg=1.6)
+        assert strong["eyes_mm"] == pytest.approx(4 * gentle["eyes_mm"], rel=1e-3)
+
+    def test_the_ceiling_reaches_it_too(self, converter, photo, tmp_path):
+        """The other half of the same fault: `limit_deg` was left at its default
+        however the caller set it, so a raised target could not get past it."""
+        from stereocraft import vr180
+        wide = self.convert(converter, photo, tmp_path / "c.jpg", vr180_size=192,
+                            target_deg=6.0, limit_deg=12.0, fmt="png")
+        pinched = self.convert(converter, photo, tmp_path / "d.jpg", vr180_size=192,
+                               target_deg=6.0, limit_deg=vr180.LIMIT_DEG, fmt="png")
+        spread = lambda info: np.abs(
+            np.asarray(Image.open(info["output"])).astype(int)[:, :192]
+            - np.asarray(Image.open(info["output"])).astype(int)[:, 192:]).mean()
+        assert spread(wide) > spread(pinched), "the clamp has to be the caller's to move"
 
 
 class TestVideo:

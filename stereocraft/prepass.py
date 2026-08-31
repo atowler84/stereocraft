@@ -4,9 +4,9 @@ The VR180 frame is the ceiling now, and a source is judged on whether it can
 fill one.  Two ways it usually cannot:
 
 **Not enough pixels.**  `vr180.natural_size` says what a source could fill, and
-portrait video mostly says no -- 720 across a phone's 65 degrees stretches to
-1980 of the 4096 that gets written.  `upscale` puts detail there rather than
-resampling into it.
+most phone video says no -- 720 across a phone's 65 degrees stretches to 1759 of
+the 4096 that gets written, and even 1280 across it reaches only 3128.  `upscale`
+puts detail there rather than resampling into it.
 
 **Not enough frames.**  30fps is markedly worse in a headset than on a flat
 screen.  60 is the target and not an arbitrary one: the decode ceiling falls as
@@ -54,10 +54,16 @@ from .video import (NO_CONSOLE, codec_for, _even, _log, _read_exactly, _stop, _t
 SMOOTH_BELOW_FPS = 59.0
 TARGET_FPS = 60.0
 # How short of the ceiling a source has to be before upscaling is worth its
-# cost.  A 1440-wide clip reaches 97% of a 4096 ceiling on its own, and the pass
+# cost.  A 1626-wide clip reaches 97% of a 4096 ceiling on its own, and the pass
 # that would close the last 3% is the most expensive thing in the app -- a big
 # source leaves room for only three frames at a time, so every frame is computed
 # three times over.  Below this the gain is worth it; above it, plainly not.
+#
+# The number is unchanged, but what it is measured against is not: `natural_size`
+# used to average pixel density across the frame width, which the periphery of a
+# wide lens flatters, and 720p landscape cleared this bar by 1% on the strength
+# of detail sitting out at the edges.  Measured where the subject is, the same
+# clip scores 0.76 and gets the pass it was asking for.
 WORTH_UPSCALING = 0.85
 # Motion-compensated, bidirectional estimation, overlapped block compensation
 # with variable block size.  The slow end of the filter's settings, which is the
@@ -77,7 +83,7 @@ def wanted(clip, settings):
         return False, None  # a flat pair is written at the source's own size
     cap = settings.vr180_cap or vr180.video_cap(clip.fps)
     lens = focal_from_35mm(DEFAULT_FOCAL_35MM, clip.width)
-    short = vr180.natural_size(clip.width, lens) < cap * WORTH_UPSCALING
+    short = vr180.natural_size(lens) < cap * WORTH_UPSCALING
     return (bool(settings.upscale) and short,
             TARGET_FPS if (settings.interpolate and clip.fps < SMOOTH_BELOW_FPS) else None)
 

@@ -2,8 +2,8 @@
 
 The VR180 frame is the ceiling now -- 4096 an eye, against a Quest 3's 25 pixels
 a degree -- and a source is judged by whether it has the detail to fill one.
-`vr180.natural_size` answers that, and portrait video mostly answers no: 720
-across a phone's 65 degrees stretches to 1980 of the 4096 that will be written.
+`vr180.natural_size` answers that, and most phone video answers no: 720 across a
+phone's 65 degrees stretches to 1759 of the 4096 that will be written.
 The projection can resample into the rest and does, but resampling moves no
 information; this puts some there.
 

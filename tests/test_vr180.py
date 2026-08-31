@@ -105,19 +105,47 @@ class TestPatch:
 class TestNaturalSize:
     """What a source could fill, as against what the frame is written at."""
 
-    def test_a_65_degree_lens_wants_nearly_three_times_its_width(self):
-        assert vr180.natural_size(1000, lens(28, 1000)) == pytest.approx(1000 * 180 / 65.47,
-                                                                        rel=1e-3)
+    def test_it_is_the_density_at_the_centre_of_frame(self):
+        """Pixels per radian on the view axis, spread over the whole 180 degrees
+        -- which for a 28mm lens on 1000 pixels is pi times its focal length."""
+        assert vr180.natural_size(lens(28, 1000)) == pytest.approx(math.pi * lens(28, 1000))
+
+    def test_it_does_not_credit_a_source_with_its_own_edge_stretch(self):
+        """The measurement this replaced, and the reason it was replaced.
+
+        A pinhole packs more pixels into a degree at the edge of the frame than
+        on the axis, so averaging density across the width reports a number the
+        middle of the picture cannot deliver.  1280 wide through a 28mm lens
+        averages out at 3519 and offers 3128 where the subject is -- and 3519 is
+        over `prepass.WORTH_UPSCALING` of a 4096 ceiling where 3128 is under it,
+        so the difference decided whether the upscaler ran at all.
+        """
+        averaged = 1280 * vr180.FOV / vr180.fov(lens(28, 1280), 1280)
+        assert averaged == pytest.approx(3519, rel=1e-3), "what it used to say"
+        assert vr180.natural_size(lens(28, 1280)) == pytest.approx(3128, rel=1e-3)
+        assert vr180.natural_size(lens(28, 1280)) < averaged
+
+    def test_the_two_agree_once_the_lens_is_narrow(self):
+        """The `sec^2` spread is what separates them, and it flattens out as the
+        field narrows -- so nothing changed for a long lens, only for a wide one."""
+        gaps = []
+        for equivalent in (28, 50, 100, 300):
+            focal = lens(equivalent, 1000)
+            averaged = 1000 * vr180.FOV / vr180.fov(focal, 1000)
+            gaps.append(averaged / vr180.natural_size(focal))
+        assert gaps == sorted(gaps, reverse=True), "the gap closes as the lens narrows"
+        assert gaps[0] > 1.12, "a 28mm frame was over-credited by an eighth"
+        assert gaps[-1] == pytest.approx(1.0, abs=2e-3), "a 300mm one by a tenth of a percent"
 
     def test_it_is_what_says_a_source_is_short_of_the_ceiling(self):
-        """720 wide reaches 1980 of a 4096 ceiling, which is the whole case for
+        """720 wide reaches 1759 of a 4096 ceiling, which is the whole case for
         upscaling; 1920 wide overshoots it and needs nothing."""
-        assert vr180.natural_size(720, lens(28, 720)) < 4096
-        assert vr180.natural_size(1920, lens(28, 1920)) > 4096
+        assert vr180.natural_size(lens(28, 720)) < 4096
+        assert vr180.natural_size(lens(28, 1920)) > 4096
 
     def test_a_longer_lens_wants_more(self):
         """The narrower the lens, the more the sphere stretches what it saw."""
-        assert vr180.natural_size(1000, lens(50, 1000)) > vr180.natural_size(1000, lens(28, 1000))
+        assert vr180.natural_size(lens(50, 1000)) > vr180.natural_size(lens(28, 1000))
 
 
 class TestProjection:
@@ -457,9 +485,9 @@ class TestAutoTarget:
     def scene(self):
         return 1.0 / torch.linspace(2.0, 40.0, 4096)[None]
 
-    def chosen(self, spot):
+    def chosen(self, spot, target_deg=vr180.TARGET_DEG):
         eyes, _ = stereo.auto_geometry(self.scene(), spot.width, spot.per_radian,
-                                       vr180.auto_target(spot))
+                                       vr180.auto_target(spot, target_deg))
         return eyes
 
     def test_a_full_frame_asks_for_its_share_of_180(self):
@@ -470,6 +498,20 @@ class TestAutoTarget:
         """The share is of the frame, and the frame got smaller."""
         assert vr180.auto_target(vr180.Patch(65.5, 51.5, 8, 8)) == pytest.approx(
             100.0 * vr180.TARGET_DEG / 65.5)
+
+    def test_the_angle_is_the_callers_to_choose(self):
+        """`TARGET_DEG` is the default and not the only answer: it is the one
+        number in `vr180` reasoned about rather than measured, so it has to be
+        possible to disagree with it.  See `Settings.target_deg`."""
+        spot = vr180.Patch(180.0, 180.0, 8, 8)
+        assert vr180.auto_target(spot, 1.8) == pytest.approx(3 * vr180.auto_target(spot, 0.6))
+        assert vr180.auto_target(spot) == vr180.auto_target(spot, vr180.TARGET_DEG)
+
+    def test_a_wider_angle_asks_for_a_wider_baseline(self):
+        """And it has to reach the geometry, not merely be stored: twice the
+        angle is twice the separation, the scene being the same one."""
+        spot = vr180.Patch(180.0, 180.0, 360, 360)
+        assert self.chosen(spot, 1.2) == pytest.approx(2 * self.chosen(spot, 0.6), rel=1e-6)
 
     @pytest.mark.parametrize("span", [180.0, 96.0, 65.5, 40.3])
     def test_the_shared_geometry_hits_that_angle(self, span):

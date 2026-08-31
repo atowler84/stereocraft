@@ -49,12 +49,24 @@ class TestWanted:
         assert prepass.wanted(clip(), VideoSettings(projection="vr180")) == (False, None)
 
     def test_a_source_barely_short_is_left_alone(self):
-        """1440 wide reaches 97% of the ceiling on its own, and closing the last
+        """1626 wide reaches 97% of the ceiling on its own, and closing the last
         3% is the most expensive thing the app does -- a source that big leaves
         room for three frames at a time, so every frame is computed three times.
         """
-        assert prepass.wanted(clip(1440, 2560), both())[0] is False
-        assert prepass.wanted(clip(1280, 720), both())[0] is False
+        assert prepass.wanted(clip(1626, 2890), both())[0] is False
+        assert prepass.wanted(clip(1920, 1080), both())[0] is False
+
+    def test_720p_landscape_is_short_after_all(self):
+        """The case that sent this measurement back to be looked at.
+
+        1280x720 used to clear `WORTH_UPSCALING` by 1%, so `--upscale` was
+        accepted and quietly did nothing on the commonest size of clip there is.
+        It cleared it on density averaged across the frame width, which the
+        `sec^2` spread at the edge of a wide lens inflates; measured on the axis,
+        where the subject is, the same clip fills 76% of the ceiling and the
+        middle of it is being enlarged 1.3x.  See `vr180.natural_size`.
+        """
+        assert prepass.wanted(clip(1280, 720), both())[0] is True
 
     def test_a_source_well_short_is_not(self):
         for width in (640, 720, 1080):
@@ -67,7 +79,7 @@ class TestWanted:
         for width in (480, 720, 1080, 1920, 3840):
             spot = clip(width, 1080)
             lens = focal_from_35mm(DEFAULT_FOCAL_35MM, width)
-            short = vr180.natural_size(width, lens) < (vr180.video_cap(30.0)
+            short = vr180.natural_size(lens) < (vr180.video_cap(30.0)
                                                         * prepass.WORTH_UPSCALING)
             assert prepass.wanted(spot, both())[0] is short
 

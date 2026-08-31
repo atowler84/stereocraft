@@ -442,7 +442,9 @@ big you want to feel, not an approximation.
   sitting in the plane of the screen.
 - **Target** (`--target`) — what `auto` aims for, as a percentage of frame width.
   The one to reach for if the whole thing is too strong or too flat: it keeps the
-  geometry and changes only how much of it there is.
+  geometry and changes only how much of it there is. On `--projection vr180` the
+  frame is 180 degrees wide and a percentage of it means nothing, so that path
+  reads `--target-deg` instead, in degrees of arc.
 
 Whatever it settles on is printed alongside the output, because there is no
 guessing it otherwise:
@@ -486,8 +488,10 @@ knowing before trusting a `--save-depth` map as a measurement.
 | --- | --- | --- |
 | `-e`, `--eyes` | `auto` | Distance between the two eyes, in millimetres, or `auto` to size it to the scene. 65 is the human average; a landscape wants far more and a close-up far less. |
 | `-f`, `--focus` | `auto` | How far away the screen plane sits, in metres, or `auto`. Whatever is at this distance sits in the screen; nearer comes out, further recedes. |
-| `-t`, `--target` | `2.0` photo, `1.3` video | What `auto` aims for: near-to-far separation as a percentage of frame width. The knob to reach for when the effect is too strong or too flat. |
-| `--limit` | `3.0` | Ceiling on separation, as a percentage of frame width, so something very close cannot demand more parallax than an eye can fuse. |
+| `-t`, `--target` | `2.0` photo, `1.3` video | What `auto` aims for: near-to-far separation as a percentage of frame width. The knob to reach for when the effect is too strong or too flat. Flat only; `--projection vr180` reads `--target-deg`. |
+| `--limit` | `3.0` | Ceiling on separation, as a percentage of frame width, so something very close cannot demand more parallax than an eye can fuse. Flat only. |
+| `--target-deg` | `0.6` | What `auto` aims for on `--projection vr180`: near-to-far separation in degrees of arc. The spherical answer to `--target`, which is a percentage of frame width and does not survive the move to a 180-degree frame. Conservative as shipped — see [VR180](#vr180). |
+| `--limit-deg` | `1.2` | Ceiling on separation for `--projection vr180`, in degrees of arc. Past about a degree the two images stop fusing and start doubling. |
 | `-m`, `--model` | `da3` | `da3` measures depth in metres. `da2-large`, `da2-base`, `da2-small` only rank it and are fitted onto an assumed range — a fallback, see [which model](#which-model). |
 | `--depth-size` | `auto` photo, `1400` video | Longest side fed to the depth network (shortest, for the `da2` models). `auto` follows the photo up to 2048 px; bigger gives cleaner subject silhouettes, which is what the warp cares about. A clip is pinned, since the finer structure is what the temporal smoothing then averages away. |
 | `--cross` | off | Write right\|left for cross-eyed viewing instead of left\|right. Not a quality setting: it only matters when free-viewing on a monitor. Adds `_cross` to the name, for the human reading the folder — no player has a word for it, and shown to a headset as an ordinary pair it puts each eye on the other one's view. |
@@ -687,13 +691,25 @@ mostly cannot:
 
 | source | could fill | ceiling | short by |
 | --- | --- | --- | --- |
-| 720 × 1280 | 1980 | 4096 | **52%** |
-| 1080 × 1920 | 2968 | 4096 | 28% |
-| 1920 × 1080 | 5279 | 4096 | — |
+| 720 × 1280 | 1759 | 4096 | **57%** |
+| 1080 × 1920 | 2639 | 4096 | 36% |
+| 1280 × 720 | 3128 | 4096 | 24% |
+| 1920 × 1080 | 4691 | 4096 | — |
 
-1490 pixels of width is all it takes to fill a 4096 ceiling, so anything shot
+1676 pixels of width is what it takes to fill a 4096 ceiling, so anything shot
 landscape at 1080p or better already has the detail. Anything narrower does not,
 and `--upscale` is what puts it there.
+
+**"Could fill" is measured on the view axis, and that is a correction.** A
+pinhole does not spread its pixels evenly over the field it covers: density rises
+as `sec²` towards the edges, so the corners of a wide frame carry half again as
+many pixels per degree as the middle. This table used to report the density
+*averaged across the frame width*, which no part of the picture actually offers
+and which the periphery flatters — 1280 × 720 came out at 3519 rather than 3128,
+which was enough to clear the bar `--upscale` is gated on. So a 720p landscape
+clip, the commonest size there is, was told it had the detail already while the
+middle of it was being enlarged 1.3×. The two measurements converge as the lens
+narrows; it was only wide ones that were being over-credited.
 
 `--vr180-size` sets the stored width by hand. A 60fps frame is about 4.3 GB of
 working memory and several seconds each, so this is the setting to turn down if
@@ -703,8 +719,16 @@ a long clip is taking longer than it is worth.
 `--target` and `--limit` are percentages of frame width, and a percentage of a
 180-degree frame is not a quantity anyone's comfort is described in — 2% of it is
 3.6 degrees of parallax, several times what an eye can fuse. So the spherical
-path aims at 0.6 degrees of near-to-far separation and caps at 1.2, in `vr180.py`.
-`--eyes` and `--focus` still mean what they always did.
+path aims at 0.6 degrees of near-to-far separation and caps at 1.2, and asks for
+both in degrees: `--target-deg` and `--limit-deg`. `--eyes` and `--focus` still
+mean what they always did, and `--target` or `--limit` on a vr180 run stops with
+a message pointing at the degree flag rather than being quietly ignored, which is
+what it used to do.
+
+0.6 degrees is worth disagreeing with. It is the one number in `vr180.py` that
+was reasoned about rather than measured, it uses less than half the 1.2 degree
+ceiling the same file sets, and on an ordinary close scene physically real 65mm
+eyes would give around 4. Try `--target-deg 1.2` and work outwards.
 
 **The lens stops being a detail.** [Where the metres come
 from](#where-the-metres-come-from) notes that a focal length wrong by some factor

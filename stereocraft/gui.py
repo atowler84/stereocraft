@@ -385,7 +385,11 @@ class App:
         # left to put back; see `_reset_button`.
         self._resets = []
         self._manual = []  # sliders that only apply when NOT matching the scene
-        self._auto_only = []  # ...and the ones that only apply when it is
+        # ...and the ones that only apply when it is.  Both of them are the Depth
+        # slider on a tab, which is a percentage of frame width -- so they also
+        # need a flat projection to mean anything, and hand over to the
+        # "Depth (VR180)" slider on General when the picture goes on a sphere.
+        self._auto_only = []
         self._vr180_only = []  # ...and the ones with nothing to say about a flat pair
         self._values = []  # every slider's reading, for the test that they all fit
         self._build_general(self.tabs)
@@ -438,6 +442,7 @@ class App:
         # window does not change shape as you look at it.
         self.projection = tk.StringVar(value=Settings.projection)
         self.surround = tk.DoubleVar(value=Settings.vr180_surround)
+        self.vr180_depth = tk.DoubleVar(value=Settings.target_deg)
         self.projection.trace_add("write", lambda *_: self._refresh_controls())
 
         row = ttk.Frame(box)
@@ -459,8 +464,19 @@ class App:
             "Fills the dark with a blurred spread of the picture, the way a social video site"
             " does behind a clip that does not fill the frame. Above 1 it is brighter than the"
             " picture was, for a scene too dark to light itself."))
+        # The Depth sliders on the Photo and Video tabs are percentages of frame
+        # width, which a 180-degree frame makes meaningless -- so this is the one
+        # they hand over to here, and they are greyed while it applies.  Both
+        # kinds of input share it: the case for a clip asking less than a still
+        # is about depth-map error shimmering, and that argument has not been
+        # measured on a sphere the way it has on a plane.
+        self._vr180_only.append(self._slider(
+            box, 11, "Depth (VR180)", self.vr180_depth, 0.2, 3.0, "{:.2f} deg",
+            "How much near-to-far separation the sphere aims for, in degrees of arc."
+            " 0.6 is the shipped default and a cautious one; real eyes on a close scene"
+            " would give several times it. Raise it until the depth reads, then back off."))
 
-        self._reset_button(box, 11, self.reset_general, self._general_at_default)
+        self._reset_button(box, 13, self.reset_general, self._general_at_default)
 
     def _build_photo(self, tabs):
         """How much depth a still asks for, and what it is written as."""
@@ -643,6 +659,7 @@ class App:
         self.cross.set(False)
         self.projection.set(Settings.projection)
         self.surround.set(Settings.vr180_surround)
+        self.vr180_depth.set(Settings.target_deg)
 
     def _general_at_default(self):
         """What the eyes and the focus go back to follows the queue: a clip is
@@ -650,7 +667,8 @@ class App:
         return (self.automatic.get() and self._sliders_at(self.recommended)
                 and not self.cross.get()
                 and self.projection.get() == Settings.projection
-                and round(self.surround.get(), 2) == Settings.vr180_surround)
+                and round(self.surround.get(), 2) == Settings.vr180_surround
+                and round(self.vr180_depth.get(), 2) == Settings.target_deg)
 
     def reset_photo(self):
         self.photo_depth.set(Settings.target_pct)
@@ -786,9 +804,13 @@ class App:
             (self.stop_button, self.running and not self.cancel.is_set()),
             # The eyes and the focus are yours only when the scene is not
             # setting them; the Depth sliders are the other way round, being
-            # what matching the scene aims for.
+            # what matching the scene aims for.  And they are percentages of
+            # frame width, so a spherical frame takes them out of play in favour
+            # of the one that asks in degrees -- they used to stay lit and do
+            # nothing, which is the fault this pair of conditions exists to fix.
             *((slider, not self.automatic.get()) for slider in self._manual),
-            *((slider, self.automatic.get()) for slider in self._auto_only),
+            *((slider, self.automatic.get() and self.projection.get() != "vr180")
+              for slider in self._auto_only),
             *((widget, self.projection.get() == "vr180") for widget in self._vr180_only),
             (self.quality_scale, self.fmt.get() != "png"),
         ):
@@ -846,6 +868,7 @@ class App:
             cross_eyed=self.cross.get(),
             projection=self.projection.get(),
             vr180_surround=round(self.surround.get(), 2),
+            target_deg=round(self.vr180_depth.get(), 2),
             on_notice=self._notice,
             on_oversize=self._ask_oversize,
         )

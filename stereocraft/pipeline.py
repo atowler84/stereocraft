@@ -90,6 +90,20 @@ class Settings:
     # honest about how close things get, and the geometry will cheerfully ask for
     # more separation than anyone can fuse.
     limit_pct: float = 3.0
+    # The same two questions, asked in degrees of arc for the vr180 path.
+    #
+    # They are a separate pair rather than a reuse of the two above because a
+    # percentage of frame width does not survive the move to a sphere: the frame
+    # is 180 degrees, so 2% of it is 3.6 degrees of parallax, several times what
+    # an eye can fuse.  Feeding `target_pct` to the spherical renderer would
+    # therefore not be a smaller effect or a larger one, it would be a different
+    # question answered with the wrong units -- so `target_pct` and `limit_pct`
+    # are left meaning exactly what they mean on a plane, and these carry the
+    # spherical case.  See `vr180.TARGET_DEG`, which is where the defaults live
+    # and which explains why 0.6 is the one number in that file with no
+    # measurement behind it.
+    target_deg: float = vr180.TARGET_DEG
+    limit_deg: float = vr180.LIMIT_DEG
     cross_eyed: bool = False
     max_size: int = 0
     quality: int = 95
@@ -591,8 +605,10 @@ class Converter:
         # Asked against the projection rather than the photo: a baseline is a
         # distance in millimetres either way, but what counts as enough of one is
         # set by how far the picture is stretched to get onto the sphere.
-        eyes, focus = self.geometry(inverse, spot.width, spot.per_radian, vr180.auto_target(spot))
+        eyes, focus = self.geometry(inverse, spot.width, spot.per_radian,
+                                    vr180.auto_target(spot, cfg.target_deg))
         left, right, mask = vr180.render(rgb, inverse, focal_full, eyes, focus, spot,
+                                         limit_deg=cfg.limit_deg,
                                          wash=cfg.vr180_surround, plate=plate)
         self.chose = (eyes, focus)
         self.covered = vr180.coverage(mask, spot)

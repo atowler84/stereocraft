@@ -100,9 +100,21 @@ def build_parser():
     parser.add_argument("-t", "--target", type=float, default=None, metavar="PCT",
                         help="what auto aims for: near-to-far separation as a %% of frame width. "
                              "(default: 2.0 photo, 1.3 video)")
-    parser.add_argument("--limit", type=float, default=3.0, metavar="PCT",
+    parser.add_argument("--limit", type=float, default=None, metavar="PCT",
                         help="ceiling on separation as a %% of frame width, so something very "
-                             "close cannot demand more parallax than an eye can fuse")
+                             "close cannot demand more parallax than an eye can fuse. "
+                             "(default: 3.0)")
+    # The spherical pair.  Separate flags rather than a reinterpretation of the
+    # two above, because a percentage of a 180-degree frame is not a quantity
+    # comfort is described in -- 2% of one is 3.6 degrees of parallax.  See
+    # `Settings.target_deg`.
+    parser.add_argument("--target-deg", type=float, default=None, metavar="DEG",
+                        help="what auto aims for on the vr180 path: near-to-far separation in "
+                             "degrees of arc. The spherical answer to --target. "
+                             f"(default: {vr180.TARGET_DEG})")
+    parser.add_argument("--limit-deg", type=float, default=None, metavar="DEG",
+                        help="ceiling on separation on the vr180 path, in degrees of arc. The "
+                             f"spherical answer to --limit. (default: {vr180.LIMIT_DEG})")
     parser.add_argument("-m", "--model", choices=("da3", "da2-small", "da2-base", "da2-large"),
                         default="da3",
                         help="da3 measures depth in metres; the da2 models only rank it, and are "
@@ -259,7 +271,7 @@ def settings_for(args, video):
     common = dict(
         model=args.model,
         focus_m=_number(args.focus),
-        limit_pct=args.limit,
+        limit_pct=Settings.limit_pct if args.limit is None else args.limit,
         cross_eyed=args.cross,
         device=args.device,
         projection=args.projection,
@@ -282,6 +294,10 @@ def settings_for(args, video):
         settings.eyes_mm = _number(args.eyes)
     if args.target is not None:
         settings.target_pct = args.target
+    if args.target_deg is not None:
+        settings.target_deg = args.target_deg
+    if args.limit_deg is not None:
+        settings.limit_deg = args.limit_deg
     if args.depth_size is not None:
         settings.depth_size = args.depth_size
     if args.vr180_size is not None:
@@ -308,13 +324,41 @@ def retired(args):
     return None
 
 
+def misdirected(args):
+    """Settings that are real, but that mean nothing on the projection asked for.
+
+    `--target` and `--limit` are percentages of frame width.  A vr180 frame is
+    180 degrees wide, and a percentage of that is not a quantity anyone's comfort
+    is described in -- 2% of one is 3.6 degrees of parallax, several times what
+    an eye can fuse -- so the spherical path asks in degrees instead and reads
+    `--target-deg` and `--limit-deg`.
+
+    What this replaces is worse than an error: `-t` parsed, appeared in `--help`,
+    was accepted without a word, and had no effect whatever on the picture.
+    Silence is the one answer a settings flag must never give, and translating
+    the percentage into an angle would be the other bad answer -- a number that
+    only looks like what was asked for.  So it says so, and says which flag to
+    reach for instead.
+    """
+    if args.projection != "vr180":
+        return None
+    for given, instead, unit in (("target", "--target-deg", "--target"),
+                                 ("limit", "--limit-deg", "--limit")):
+        if getattr(args, given) is not None:
+            return (f"{unit} is a percentage of frame width, which means nothing on a "
+                    f"180-degree frame: use {instead} to say it in degrees of arc. "
+                    f"(vr180 aims at {vr180.TARGET_DEG} degrees and caps at "
+                    f"{vr180.LIMIT_DEG} by default.)")
+    return None
+
+
 def main(argv=None):
     logbook.start()
     args = build_parser().parse_args(argv)
-    retirement = retired(args)
-    if retirement:
-        print(retirement, file=sys.stderr)
-        return 2
+    for complaint in (retired(args), misdirected(args)):
+        if complaint:
+            print(complaint, file=sys.stderr)
+            return 2
     if args.gui:
         from .gui import main as gui_main
 
