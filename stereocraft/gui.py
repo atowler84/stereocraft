@@ -16,7 +16,7 @@ try:
 except ImportError:  # pragma: no cover - depends on the Python build
     tk = None
 
-from . import logbook
+from . import __version__, logbook
 from .pipeline import SUFFIXES, Converter, Settings, VideoSettings
 from .video import VIDEO_SUFFIXES, clock, convert_video
 
@@ -186,7 +186,7 @@ class App:
         self.notices = []
         self.cross_used = False  # the viewing order the current run is writing
 
-        root.title("StereoCraft - side-by-side 3D")
+        root.title(f"StereoCraft {__version__} - 2D->3D Photo & Video Creator")
         self._set_icon(root)
         root.minsize(1060, 720)
         # A size below the default for the second line of a queue row and the
