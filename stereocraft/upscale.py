@@ -577,10 +577,30 @@ FINISHED_BYTES_PER_PIXEL = 10
 # seconds of work at a time, which is a reasonable thing to ask someone to wait
 # for and a reasonable thing to throw away when they stop.
 #
-# It could rise, and there is a case for it: eighteen would put `BEST_OVERLAP`
-# at the full six frames rather than five.  That is a change to how every clip
-# is converted rather than to whether it converts at all, so it is left alone
-# here and noted as available.
+# **Sixteen and not eighteen, which the arithmetic makes look tempting.**
+# Eighteen is the next number that divides by `OVERLAP_SHARE` into a longer
+# run-up, and would put `BEST_OVERLAP` at the full six frames rather than five.
+# It buys nothing:
+#
+#                    chunk 16   chunk 18
+#     overlap               5          6
+#     advance               6          6
+#     passes a frame     2.67       3.00
+#     chunks for 600       98         98
+#
+# The window advances by six either way, so a clip is cut into the same number
+# of chunks and has the same number of joins -- the thing a longer run-up is
+# supposed to improve is not the count of joins but each one, and each one is
+# already past the point this file measured as converged.  See `OVERLAP`: 0.23
+# of full scale at the very edge against 0.04 four frames in, which is why
+# `GOOD_OVERLAP` is four and why the frame between there and `BEST_OVERLAP` is
+# called below anything a headset shows.  Five to six is a further slice of a
+# curve that had already flattened.
+#
+# What it would cost is every frame in the clip computed three times over
+# instead of 2.67, which is 12% on the slowest pass in the app -- and it spends
+# exactly the headroom `OVERLAP_SHARE` exists to keep, landing on the ceiling of
+# three that constant was chosen to hold rather than under it.
 MAX_CHUNK = 16
 # The overlap gives way before the card does.  Shortening it costs temporal
 # context at the joins, which is a visible seam; not shortening it costs the
