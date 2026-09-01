@@ -54,16 +54,24 @@ class Invented(torch.nn.Module):
 
 class Residue(torch.nn.Module):
     """Stands in for the cleaning module, predicting a residual of a size given
-    in advance and counting how often it was asked for one."""
+    in advance and counting how often it was asked for one.
+
+    `per_frame` gives a size for each frame of the chunk in turn, for the tests
+    that care whether the stopping rule reads the chunk or a single frame.
+    """
 
     def __init__(self, size):
         super().__init__()
         self.size = size
+        self.per_frame = None
         self.calls = 0
 
     def forward(self, x):
+        size = self.size
+        if self.per_frame:
+            size = self.per_frame[self.calls % len(self.per_frame)]
         self.calls += 1
-        return torch.full_like(x, self.size)
+        return torch.full_like(x, size)
 
 
 class Passthrough(torch.nn.Module):
@@ -125,19 +133,27 @@ class TestChunkPlan:
         eight times slower, measured -- so the estimate has to stay under it."""
         for width, height in self.UPSCALED:
             chunk, _ = upscale.chunk_plan(free, width, height, out_width=2048)
-            cost = upscale.FIXED_BYTES + chunk * (
-                upscale.BYTES_PER_SOURCE_PIXEL * width * height
-                + 3 * 2048 * (2048 * height / width) * 2)
+            cost = (upscale.FIXED_BYTES
+                    + upscale.WORKING_BYTES_PER_PIXEL * width * height
+                    + chunk * (upscale.CHUNK_BYTES_PER_PIXEL * width * height
+                               + upscale.FINISHED_BYTES_PER_PIXEL
+                               * 2048 * (2048 * height / width)))
             assert cost < 16e9, f"{width}x{height} at {free/1e9:.0f}GB wants {cost/1e9:.1f}GB"
 
     def test_the_ceiling_is_low_on_purpose(self):
         assert upscale.chunk_plan(64e9, 320, 240)[0] <= upscale.MAX_CHUNK
 
     def test_the_overlap_gives_way_before_the_card_does(self):
-        """Six frames each end wants a chunk of thirteen, which at 1080x1920 is
-        past a 16 GB card before a single frame is upscaled.  Shortening the
-        overlap costs a seam; not shortening it costs the conversion."""
-        _, overlap = upscale.chunk_plan(15.7e9, 1080, 1920, out_width=2048)
+        """Six frames each end wants a chunk of thirteen.  Where the room will
+        not stretch to that the overlap is what shortens: it costs a seam, and
+        not shortening it costs the conversion.
+
+        This used to be asked of 1080x1920 on a 16 GB card, which is the case
+        the memory model was wrong about -- it now runs at a full chunk and a
+        full run-up, and the question has to be put to a card that really is
+        short of room.
+        """
+        _, overlap = upscale.chunk_plan(4.5e9, 1080, 1920, out_width=2048)
         assert overlap < upscale.OVERLAP
 
     def test_the_overlap_never_eats_the_chunk(self):
@@ -172,16 +188,22 @@ class TestChunkPlan:
         to be able to come out either way: silent where the run-up has converged,
         and speaking where memory really did cut into it."""
         _, roomy = upscale.chunk_plan(32e9, 720, 1280, out_width=1980)
-        _, cramped = upscale.chunk_plan(13e9, 720, 1280, out_width=1980)
+        _, cramped = upscale.chunk_plan(3.5e9, 720, 1280, out_width=1980)
         assert roomy >= upscale.GOOD_OVERLAP, "a card with room should not be warned"
         assert cramped < upscale.GOOD_OVERLAP, "a card without it should be"
 
     def test_a_converged_run_up_is_not_warned_about(self):
         """Four frames is where the edge measurement flattens -- 0.04 of full
-        scale against 0.23 at the very edge -- and a 16 GB card lands there
-        routinely.  Warning about it trains the reader to ignore the warning."""
-        _, overlap = upscale.chunk_plan(14.5e9, 720, 1280, out_width=1980)
-        assert overlap == 4, "the 16 GB case this threshold was chosen for"
+        scale against 0.23 at the very edge -- so a run-up of four is worth
+        having and not worth mentioning.  Warning about it trains the reader to
+        ignore the warning.
+
+        A 16 GB card used to land on exactly four, which is what the threshold
+        was chosen against; it reaches the full five now, so the case that lands
+        on four is a much smaller one.
+        """
+        _, overlap = upscale.chunk_plan(5e9, 720, 1280, out_width=1980)
+        assert overlap == 4, "the case this threshold was chosen for"
         assert overlap >= upscale.GOOD_OVERLAP, "so it should pass without a word"
 
     def test_the_quiet_threshold_is_reachable(self):
@@ -197,6 +219,48 @@ class TestChunkPlan:
 
     def test_it_does_not_decline_when_there_is_room(self):
         assert upscale.chunk_plan(15.7e9, 720, 1280, out_width=2048)[0] >= upscale.MIN_USEFUL_CHUNK
+
+    def test_portrait_1080p_on_a_16gb_card_is_not_declined(self):
+        """The case the whole memory model was wrong about.
+
+        A phone's portrait 1080p is squarely inside the range that wants this
+        pass -- 2639 of a 4096 ceiling -- and it was being told there was no
+        room, because the cost of the upsample head was booked as a fixed 6.5 GB
+        that did not grow with the frame and as 400 bytes a source pixel that
+        did grow with the chunk.  It was neither.  Measured, the whole chunk now
+        peaks at 4.06 GB for sixteen frames.
+        """
+        chunk, overlap = upscale.chunk_plan(15.7e9, 1080, 1920, out_width=2084)
+        assert chunk == upscale.MAX_CHUNK, "a full chunk, not a declined pass"
+        assert overlap == upscale.BEST_OVERLAP, "and the longest run-up going"
+
+    def test_chunk_length_is_nearly_free(self):
+        """What the backward stack going to host memory bought, and the reason
+        the plan can stop trading the run-up away.
+
+        Everything that still grows with the chunk is small: the frames
+        themselves at 6 bytes a pixel, the model's cleaned copy of them at 6,
+        both flow fields at 8, and the finished frames at whatever `out_width`
+        asks for.  Against a working set of 400 bytes a pixel that is paid once,
+        a frame of the chunk is cheap -- so a card carrying two working sets
+        beyond the fixed cost already has room to run, and one carrying three
+        and a half reaches the full chunk.
+        """
+        source = upscale.WORKING_BYTES_PER_PIXEL * 1080 * 1920
+        enough = (upscale.FIXED_BYTES + source * 2) / 0.8
+        assert upscale.chunk_plan(enough, 1080, 1920, out_width=2084)[0] >= \
+            upscale.MIN_USEFUL_CHUNK, f"{enough/1e9:.1f}GB should be enough to run"
+        roomy = (upscale.FIXED_BYTES + source * 3.5) / 0.8
+        assert upscale.chunk_plan(roomy, 1080, 1920, out_width=2084)[0] == upscale.MAX_CHUNK
+
+    def test_the_frames_working_set_is_charged_once_and_not_per_frame(self):
+        """The shape of the fix, stated as the plan sees it.  Only one frame is
+        ever inside the head, so its working set comes off the top; charging it
+        per frame of the chunk is what made a big frame look unaffordable."""
+        big = upscale.chunk_plan(8e9, 1080, 1920, out_width=2084)[0]
+        small = upscale.chunk_plan(8e9, 720, 1280, out_width=2084)[0]
+        assert big == small == upscale.MAX_CHUNK, (
+            "both fit a full chunk; the larger frame costs more room, not fewer frames")
 
     def test_a_roomy_case_keeps_as_much_overlap_as_it_can_afford(self):
         _, overlap = upscale.chunk_plan(15.7e9, 640, 480, out_width=2048)
@@ -269,15 +333,178 @@ class TestDetail:
         assert 0.5 < upscale.DETAIL < 1.0
 
 
+class TestTheBandedHead:
+    """That splitting the upsample head into bands changes nothing.
+
+    This is the load-bearing claim of the whole memory arrangement.  The head is
+    where nearly all of the model's memory goes -- 8.33 GB a megapixel of source
+    for one frame -- and it is run in bands so that a big frame costs what a
+    small one does.  Bands are only acceptable if they are invisible, and the
+    reason they are is that everything in the head is a local operation: four
+    3x3 convolutions, two pixel shuffles and a `scale_factor` enlargement, none
+    of which can see further than `HEAD_HALO` rows of source.
+
+    So this is not "the seam is small".  In fp32 there is no difference at all.
+    """
+
+    def head(self, model, feat, lr, band_pixels, out_size=None, monkeypatch=None):
+        monkeypatch.setattr(upscale, "HEAD_BAND_PIXELS", band_pixels)
+        with torch.inference_mode():
+            return model.head(feat, lr, out_size)
+
+    def build(self):
+        torch.manual_seed(0)
+        return upscale.BasicVSR(blocks=1).eval()
+
+    def frames(self, h=48, w=32):
+        torch.manual_seed(1)
+        return torch.rand(1, 64, h, w), torch.rand(1, 3, h, w)
+
+    # A couple of fp32 ulps.  Splitting the frame changes the shape of the
+    # tensors the convolutions are handed, and a convolution blocks and
+    # accumulates differently for a different shape -- so a few frames a band
+    # comes out bit-identical and a great many bands comes out one ulp adrift.
+    # That is floating-point associativity, not the bands showing: 6e-08 against
+    # an 8-bit level at 3.9e-03 is five orders of magnitude below anything that
+    # reaches a headset, and `test_nothing_gathers_at_the_joins` is what
+    # separates rounding from a seam.
+    ROUNDING = 1e-6
+
+    def test_bands_reproduce_the_whole_frame(self, monkeypatch):
+        model, (feat, lr) = self.build(), self.frames()
+        whole = self.head(model, feat, lr, 1 << 30, monkeypatch=monkeypatch)
+        for bands in (2, 3, 5, 8, 48):
+            band_pixels = max(1, feat.shape[2] * feat.shape[3] // bands)
+            got = self.head(model, feat, lr, band_pixels, monkeypatch=monkeypatch)
+            worst = (got - whole).abs().max().item()
+            assert worst < self.ROUNDING, f"{bands} bands differs by {worst:.3e}"
+
+    def test_a_few_bands_are_exact_to_the_bit(self, monkeypatch):
+        """Where the band is big enough that the convolutions block the same way,
+        there is no difference at all -- which is the claim being made, with the
+        rounding above as the only thing standing between it and the general
+        case."""
+        model, (feat, lr) = self.build(), self.frames()
+        whole = self.head(model, feat, lr, 1 << 30, monkeypatch=monkeypatch)
+        for bands in (2, 3):
+            band_pixels = feat.shape[2] * feat.shape[3] // bands
+            got = self.head(model, feat, lr, band_pixels, monkeypatch=monkeypatch)
+            assert torch.equal(got, whole), f"{bands} bands should be exact"
+
+    def test_nothing_gathers_at_the_joins(self, monkeypatch):
+        """The test that would catch a seam.  Whatever difference banding leaves
+        has to be spread over the frame like rounding and not piled up where the
+        bands meet -- a seam is not a large error, it is a *placed* one."""
+        model, (feat, lr) = self.build(), self.frames(h=96, w=32)
+        whole = self.head(model, feat, lr, 1 << 30, monkeypatch=monkeypatch)
+        rows = 12
+        got = self.head(model, feat, lr, rows * 32, monkeypatch=monkeypatch)
+        error = (got - whole).abs().amax(dim=(0, 1, 3))
+        at_join = torch.zeros(error.shape[0], dtype=torch.bool)
+        for join in range(rows, feat.shape[2], rows):
+            at_join[max(0, join * upscale.SCALE - 4):join * upscale.SCALE + 4] = True
+        assert at_join.any(), "the bands have to actually meet somewhere"
+        assert error[at_join].max() <= error.max(), (
+            "the joins are carrying more error than the picture around them")
+
+    def test_a_halo_too_short_would_have_shown_up(self):
+        """The test above only means something if it could fail.  `HEAD_HALO` is
+        two because the receptive field of the head works out to two; at one the
+        bands differ, and only at the joins, which is what a seam looks like."""
+        model, (feat, lr) = self.build(), self.frames()
+        with torch.inference_mode():
+            whole = model.head(feat, lr)
+            rows = feat.shape[2] // 2
+            lo = max(0, rows - 1)  # a halo of one, by hand
+            band = model.lrelu(model.upsample1(feat[:, :, lo:]))
+            band = model.lrelu(model.upsample2(band))
+            band = model.lrelu(model.conv_hr(band))
+            band = model.conv_last(band)
+            band += torch.nn.functional.interpolate(
+                lr[:, :, lo:], scale_factor=upscale.SCALE, mode="bilinear",
+                align_corners=False)
+            short = band[:, :, (rows - lo) * upscale.SCALE:]
+        assert not torch.equal(short, whole[:, :, rows * upscale.SCALE:]), (
+            "a one-row halo should not reproduce the frame, or the halo is doing nothing")
+
+    def test_the_halo_is_what_the_receptive_field_needs(self):
+        assert upscale.HEAD_HALO == 2
+
+    def test_a_frame_small_enough_is_not_banded_at_all(self):
+        """No overhead where there is nothing to save."""
+        model, (feat, lr) = self.build(), self.frames()
+        assert feat.shape[2] * feat.shape[3] < upscale.HEAD_BAND_PIXELS
+        with torch.inference_mode():
+            assert torch.equal(model.head(feat, lr), model.head(feat, lr))
+
+    def test_the_resize_to_out_size_survives_banding(self, monkeypatch):
+        """The bicubic onto `out_size` depends on the extent of what it is given,
+        so it waits for the bands to be assembled rather than moving into the
+        loop.  If it ever moved, this is what would catch it."""
+        model, (feat, lr) = self.build(), self.frames()
+        out_size = (100, 70)
+        whole = self.head(model, feat, lr, 1 << 30, out_size, monkeypatch)
+        got = self.head(model, feat, lr, 64, out_size, monkeypatch)
+        assert got.shape[-2:] == out_size
+        assert (got - whole).abs().max() < self.ROUNDING
+
+
+class TestFlowAPairAtATime:
+    """Flow is computed one pair at a time rather than as one batch, for the
+    memory.  Every pair is independent, so the flows must not have moved."""
+
+    def test_it_matches_the_batched_call(self):
+        torch.manual_seed(0)
+        model = upscale.BasicVSR(blocks=1).eval()
+        lrs = torch.rand(1, 5, 3, 32, 24)
+        with torch.inference_mode():
+            backward, forward = model.compute_flow(lrs)
+            n, t, c, h, w = lrs.shape
+            a = lrs[:, :-1].reshape(-1, c, h, w)
+            b = lrs[:, 1:].reshape(-1, c, h, w)
+            # To a couple of fp32 ulps, for the same reason the banded head is:
+            # a convolution handed four pairs at once accumulates in a different
+            # order from one handed a pair four times.
+            assert torch.allclose(backward, model.spynet(a, b).view(n, t - 1, 2, h, w),
+                                  rtol=0, atol=1e-6)
+            assert torch.allclose(forward, model.spynet(b, a).view(n, t - 1, 2, h, w),
+                                  rtol=0, atol=1e-6)
+
+    def test_the_two_directions_are_not_the_same_flow(self):
+        """Cheap, and it would catch the pair being handed over the wrong way
+        round -- which would still run, and would propagate along a motion that
+        is not the one in the clip."""
+        torch.manual_seed(0)
+        model = upscale.BasicVSR(blocks=1).eval()
+        lrs = torch.rand(1, 3, 3, 32, 24)
+        with torch.inference_mode():
+            backward, forward = model.compute_flow(lrs)
+        assert not torch.equal(backward, forward)
+
+
 class TestCleaning:
     """How many times the cleaning module runs, which is what made converted
-    clips look like cartoons when it was a fixed two."""
+    clips look like cartoons when it was a fixed two.
+
+    Counted in passes over the chunk rather than in calls to the module.  The
+    two used to be the same number, the whole chunk going through as one batch;
+    the module is fed a frame at a time now -- for the memory, and for the same
+    picture -- so a pass is `frames` calls and the thing being tested is how
+    many times the sequence is swept.
+    """
+
+    FRAMES = 4
 
     def build(self, residue):
         model = upscale.RealBasicVSR(cleaning_blocks=1, blocks=1)
         model.image_cleaning = Residue(residue)
         model.basicvsr = Passthrough()
         return model.eval()
+
+    def passes(self, model):
+        assert model.image_cleaning.calls % self.FRAMES == 0, (
+            "a pass cleans every frame or it is not a pass")
+        return model.image_cleaning.calls // self.FRAMES
 
     def test_clean_footage_is_cleaned_once(self):
         """The reference's own rule: stop as soon as the residual is small, with
@@ -286,14 +513,48 @@ class TestCleaning:
         off a clean frame is the picture's own texture."""
         model = self.build(residue=0.01)
         with torch.inference_mode():
-            model(torch.zeros(1, 4, 3, 8, 8))
-        assert model.image_cleaning.calls == 1
+            model(torch.zeros(1, self.FRAMES, 3, 8, 8))
+        assert self.passes(model) == 1
 
     def test_something_still_full_of_artefacts_is_cleaned_again(self):
         model = self.build(residue=2.0)
         with torch.inference_mode():
-            model(torch.zeros(1, 4, 3, 8, 8))
-        assert model.image_cleaning.calls == upscale.CLEANING_LIMIT
+            model(torch.zeros(1, self.FRAMES, 3, 8, 8))
+        assert self.passes(model) == upscale.CLEANING_LIMIT
+
+    def test_the_stopping_rule_reads_the_whole_chunk_and_not_one_frame(self):
+        """The threshold is compared against the mean residual over the chunk.
+        A frame at a time, that only stays true if the mean is accumulated
+        across the pass and the decision taken after it -- decided per frame,
+        a chunk whose frames straddle the threshold would clean some of them
+        twice and leave the rest, which is a flicker rather than a clean.
+        """
+        model = self.build(residue=0.0)
+        # Half the chunk far above the threshold, half far below: either way
+        # the mean lands above it, so every frame gets a second pass.
+        model.image_cleaning.per_frame = [4.0, 4.0, 0.0, 0.0]
+        with torch.inference_mode():
+            model(torch.zeros(1, self.FRAMES, 3, 8, 8))
+        assert self.passes(model) == upscale.CLEANING_LIMIT
+
+    def test_a_chunk_that_is_clean_on_average_stops(self):
+        model = self.build(residue=0.0)
+        # The mirror image: one noisy frame, the rest spotless, mean below the
+        # threshold.  One pass, as for any other clean chunk.
+        model.image_cleaning.per_frame = [2.0, 0.0, 0.0, 0.0]
+        with torch.inference_mode():
+            model(torch.zeros(1, self.FRAMES, 3, 8, 8))
+        assert self.passes(model) == 1
+
+    def test_the_caller_keeps_its_own_frames(self):
+        """Cleaning happens in place now, so the chunk handed in has to be
+        cloned first -- `run` reads the frames it passed in again, to blend the
+        model's picture back towards a plain enlargement of them."""
+        model = self.build(residue=0.5)
+        seq = torch.zeros(1, self.FRAMES, 3, 8, 8)
+        with torch.inference_mode():
+            model(seq)
+        assert torch.equal(seq, torch.zeros(1, self.FRAMES, 3, 8, 8))
 
     def test_it_never_runs_away(self):
         assert upscale.CLEANING_LIMIT == 3  # the reference's ceiling

@@ -52,6 +52,46 @@ SHA256 = "f2d73c0fe3e33869c812f608be77cbdbfc356443b718b78c9a6cb97027ce5de7"
 # optimizer state as well -- 210 MB, of which the generator is 25.
 WEIGHTS_PREFIX = "generator_ema."
 SCALE = 4
+# The most source pixels to send through the upsample head at once.
+#
+# The head is where nearly all of this model's memory goes, and not by a little:
+# measured at 8.33 GB for every megapixel of source, for a *single* frame, dead
+# linear from 480x854 through to 1080x1920.  `upsample2` and `conv_hr` hold 64
+# channels at four times the frame -- 4320x7680, 4.25 GB a tensor, several of
+# them alive at once -- and then `out_size` takes it all straight back down
+# again, which is a great deal of memory spent on pixels that are discarded a
+# line later.
+#
+# It is a per-frame cost and not a per-chunk one, which the chunking below was
+# once built on the opposite belief about: at 1080x1920 the head peaks at 18.46
+# GB for a chunk of four and 19.39 GB for a chunk of seven.  Shortening the
+# chunk was never going to pay for it, which is why a clip that plainly had room
+# was told there was none.
+#
+# Banded, it costs this many pixels' worth whatever size the frame is, which is
+# what makes a big frame affordable and a long chunk nearly free.  240k is a
+# little under 2 GB at the figure above.
+HEAD_BAND_PIXELS = 240_000
+# Rows of source each band is grown by before it is computed, and trimmed of
+# afterwards.
+#
+# The head is four 3x3 convolutions and two pixel shuffles and nothing else --
+# every one of them local -- so a halo does not approximate the whole-frame
+# answer, it reproduces it.  Measured against the unbanded head: at a halo of one
+# the bands differ by 1.4e-01 and only at the joins, and at two they are
+# bit-identical in fp32.  In fp16 the joins differ by 4.9e-04 against 9.8e-04 for
+# the picture away from them, so the joins are quieter than the frame's own
+# rounding -- which is the point.  This is not a seam being hidden well; there is
+# no seam.
+#
+# Two is what the receptive field works out to and what the measurement found,
+# and the two agreeing is the reason to trust it.  Note that the bilinear skip
+# below survives banding for a reason that is easy to lose: `scale_factor` with
+# `align_corners=False` is a pure affine map that does not know the tensor's
+# extent, so a slice enlarged is the enlargement sliced.  The bicubic resize to
+# `out_size` is *not* extent-independent, which is why it stays on the assembled
+# frame rather than moving into the band loop.
+HEAD_HALO = 2
 # Frames thrown away at each end of a chunk.  Propagation runs both ways along
 # the sequence, so a frame near either end has seen less of the clip than one in
 # the middle and is reconstructed differently -- measured at 0.23 of full scale
@@ -237,51 +277,107 @@ class BasicVSR(nn.Module):
         self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
 
     def compute_flow(self, lrs):
+        """Flow between every adjacent pair, both ways, a pair at a time.
+
+        The obvious way to write this is one `spynet` call on a batch of `t - 1`
+        pairs, and that is what it was.  Every pair is independent of every
+        other, so the flows are the same either way -- but the batched call
+        builds a six-level pyramid for the whole chunk at once and runs a
+        five-convolution module at 32 and 64 channels over all of it at the
+        widest level.  Measured at 1080x1920 and a chunk of seven: 5.65 GB
+        batched against 1.18 GB one pair after another, for the same numbers.
+        """
         n, t, c, h, w = lrs.size()
-        a = lrs[:, :-1].reshape(-1, c, h, w)
-        b = lrs[:, 1:].reshape(-1, c, h, w)
-        return (self.spynet(a, b).view(n, t - 1, 2, h, w),
-                self.spynet(b, a).view(n, t - 1, 2, h, w))
+        backward = lrs.new_empty(n, t - 1, 2, h, w)
+        forward = lrs.new_empty(n, t - 1, 2, h, w)
+        for i in range(t - 1):
+            a, b = lrs[:, i], lrs[:, i + 1]
+            backward[:, i] = self.spynet(a, b)
+            forward[:, i] = self.spynet(b, a)
+        return backward, forward
+
+    def head(self, feat, lr, out_size=None):
+        """One frame, from fused features to finished pixels, in bands.
+
+        Banded because this is the one expensive thing the model does -- see
+        `HEAD_BAND_PIXELS` -- and banded exactly rather than approximately,
+        because everything in here is a local operation and `HEAD_HALO` covers
+        the reach of all of it.
+
+        The resize to `out_size` waits until the bands are assembled: it is a
+        bicubic with antialiasing onto a given size, which depends on the extent
+        of what it is given and so is the one step that would not survive being
+        done a band at a time.
+        """
+        n, _, h, w = feat.shape
+        bands = max(1, math.ceil(h * w / HEAD_BAND_PIXELS))
+        rows = math.ceil(h / bands)
+        out = feat.new_empty(n, 3, h * SCALE, w * SCALE)
+        for start in range(0, h, rows):
+            stop = min(h, start + rows)
+            lo, hi = max(0, start - HEAD_HALO), min(h, stop + HEAD_HALO)
+            band = self.lrelu(self.upsample1(feat[:, :, lo:hi]))
+            band = self.lrelu(self.upsample2(band))
+            band = self.lrelu(self.conv_hr(band))
+            band = self.conv_last(band)
+            # The network learns the difference from a plain enlargement, which
+            # is why it can be this small and still hold the picture together.
+            band += F.interpolate(lr[:, :, lo:hi], scale_factor=SCALE,
+                                  mode="bilinear", align_corners=False)
+            keep = (start - lo) * SCALE
+            out[:, :, start * SCALE:stop * SCALE] = band[:, :, keep:keep + (stop - start) * SCALE]
+            del band
+        if out_size is not None and out.shape[-2:] != tuple(out_size):
+            out = F.interpolate(out, size=tuple(out_size), mode="bicubic",
+                                align_corners=False, antialias=True)
+        return out
 
     def forward(self, lrs, out_size=None):
         """`out_size` resizes each frame as it is finished rather than after the
-        whole sequence is built.  The finished frames are four times the input
-        and dominate what a chunk costs, so shrinking them to the width the
-        caller actually wants is what makes a long chunk affordable -- and a long
-        chunk is what keeps the propagation honest at the ends.
+        whole sequence is built.  The finished frames are four times the input,
+        so shrinking them to the width the caller actually wants is what makes a
+        long chunk affordable -- and a long chunk is what keeps the propagation
+        honest at the ends.
+
+        Written into one tensor as they are finished rather than collected and
+        stacked at the end.  `torch.stack` on a list of finished frames wants a
+        second copy of every one of them at the moment the chunk is complete,
+        which is the most expensive moment to ask for it.
         """
         n, t, c, h, w = lrs.size()
         flows_backward, flows_forward = self.compute_flow(lrs)
 
-        outputs = []
+        # The backward pass produces a 64-channel map per frame -- 265 MB a frame
+        # at 1080x1920 -- and nothing looks at any of them again until the
+        # forward pass arrives at that index.  Held in host memory instead they
+        # cost a round trip over PCIe, and what that buys is a memory model that
+        # barely has a chunk length in it: measured at 1080x1920, a chunk of
+        # fourteen peaks 0.2 GB above a chunk of seven.  Which is the right way
+        # round, the long chunk being the one with the better joins.
+        stack = []
         feat_prop = lrs.new_zeros(n, self.fusion.in_channels // 2, h, w)
         for i in range(t - 1, -1, -1):
             if i < t - 1:
                 feat_prop = flow_warp(feat_prop, flows_backward[:, i].permute(0, 2, 3, 1))
             feat_prop = self.backward_resblocks(torch.cat([lrs[:, i], feat_prop], dim=1))
-            outputs.append(feat_prop)
-        outputs = outputs[::-1]
+            stack.append(feat_prop.to("cpu"))
+        stack.reverse()
 
+        out_h, out_w = out_size if out_size is not None else (h * SCALE, w * SCALE)
+        finished = lrs.new_empty(n, t, 3, out_h, out_w)
         feat_prop = torch.zeros_like(feat_prop)
         for i in range(t):
             if i > 0:
                 feat_prop = flow_warp(feat_prop, flows_forward[:, i - 1].permute(0, 2, 3, 1))
             feat_prop = self.forward_resblocks(torch.cat([lrs[:, i], feat_prop], dim=1))
 
-            out = self.lrelu(self.fusion(torch.cat([outputs[i], feat_prop], dim=1)))
-            out = self.lrelu(self.upsample1(out))
-            out = self.lrelu(self.upsample2(out))
-            out = self.lrelu(self.conv_hr(out))
-            out = self.conv_last(out)
-            # The network learns the difference from a plain enlargement, which
-            # is why it can be this small and still hold the picture together.
-            out += F.interpolate(lrs[:, i], scale_factor=SCALE, mode="bilinear",
-                                 align_corners=False)
-            if out_size is not None and out.shape[-2:] != tuple(out_size):
-                out = F.interpolate(out, size=tuple(out_size), mode="bicubic",
-                                    align_corners=False, antialias=True)
-            outputs[i] = out
-        return torch.stack(outputs, dim=1)
+            back = stack[i].to(lrs.device)
+            stack[i] = None  # let go of the host copy as it is spent
+            fused = self.lrelu(self.fusion(torch.cat([back, feat_prop], dim=1)))
+            del back
+            finished[:, i] = self.head(fused, lrs[:, i], out_size)
+            del fused
+        return finished
 
 
 class RealBasicVSR(nn.Module):
@@ -316,14 +412,32 @@ class RealBasicVSR(nn.Module):
         self.cleaning_thres = cleaning_thres
 
     def forward(self, lqs, out_size=None):
+        """Cleaned a frame at a time rather than as one batch of the whole chunk.
+
+        The module has no notion of sequence -- it restores each frame on its own
+        -- so the picture is the same either way, but the batched call runs a
+        twenty-block residual stack over every frame at once and measured 11.24
+        GB at 1080x1920 on a chunk of seven.
+
+        The stopping rule is the one place the batch genuinely mattered: it
+        compares the mean residual *over the chunk* against the threshold, not
+        the mean over one frame.  So the mean is accumulated across a pass and
+        the decision taken after it, which is the same number as before -- every
+        frame holds the same count of elements, so the mean of the per-frame
+        means is the batch's mean.  Accumulated in fp32 because a chain of fp16
+        additions is not owed this much.
+        """
         n, t, c, h, w = lqs.size()
+        lqs = lqs.clone()  # cleaned in place from here, and the caller's to keep
         for _ in range(self.cleaning_limit):
-            flat = lqs.view(-1, c, h, w)
-            residue = self.image_cleaning(flat)
-            lqs = (flat + residue).view(n, t, c, h, w)
+            residual = torch.zeros((), device=lqs.device, dtype=torch.float32)
+            for i in range(t):
+                residue = self.image_cleaning(lqs[:, i])
+                lqs[:, i] += residue
+                residual += residue.abs().mean().float()
             # Stop as soon as there is nothing much left to take off, which is
             # the reference's own rule and on clean footage is after one pass.
-            if float(residue.abs().mean()) < self.cleaning_thres:
+            if float(residual) / t < self.cleaning_thres:
                 break
         return self.basicvsr(lqs, out_size=out_size)
 
@@ -389,31 +503,93 @@ def load(device="cpu", dtype=torch.float32, path=None):
     return model.to(device=device, dtype=dtype).eval()
 
 
-# What a chunk costs, measured on a 4080 at 720x1280 in fp16 rather than
-# reasoned about -- the first attempt at this reasoned about it, guessed a fixed
-# cost of 1.5 GB against a real 6.1, and asked for 46 frames on a 16 GB card:
+# What a chunk costs, measured on a 4080 in fp16 rather than reasoned about.
 #
-#     frames    peak      time
-#          8   8.8 GB    4.5 s
-#         16  11.5 GB   11.4 s
-#         24  17.3 GB   89.7 s   <- past the card, spilling to host memory
-#         32  23.0 GB  151.6 s
+# **This was wrong in shape, and it is worth saying how.**  It read
 #
-# Past the card it does not fail, it crawls: eight times slower at 24 frames
-# than at 16, for half again as many.  So the ceiling is low and deliberate.
-FIXED_BYTES = 6.5e9
-# Per source pixel per frame, which is where the propagation features and the
-# flow pyramids live.  The finished frames are counted separately, being the one
-# part that shrinks when the caller asks for a smaller output.
-BYTES_PER_SOURCE_PIXEL = 400
-# However much room there seems to be.  A longer chunk buys a little temporal
-# context and costs a great deal of memory, and the overlap already covers the
-# context; going past this has only ever bought thrashing.
+#     6.5 GB fixed + 400 bytes per source pixel per frame of the chunk
+#
+# on the belief that memory grew with chunk length and that a fixed 6.5 GB sat
+# under it.  Measured stage by stage, neither half held: the upsample head alone
+# peaked at 18.46 GB for a chunk of four and 19.39 GB for a chunk of seven at
+# 1080x1920 -- a per-*frame* cost, scaling with the frame's area and hardly at
+# all with the chunk.  So the term that actually blew the budget was hiding
+# inside a constant that claimed not to grow, and the plan responded to trouble
+# by shortening a chunk that was never the problem.  A portrait 1080p clip on a
+# 16 GB card was told there was no room for a pass it had ample room for.
+#
+# With the head banded, the cleaning done a frame at a time and the backward
+# stack parked in host memory, the same measurement gives three honest terms:
+#
+#     source       chunk 6   chunk 10   chunk 16
+#     720x1280      2.62 GB   2.88 GB    3.27 GB
+#     1080x1920     3.18 GB   3.53 GB    4.06 GB
+#     1280x2276     3.62 GB   4.04 GB    4.67 GB
+#
+# which separate to within 0.2 GB across all nine, and each term is something
+# the code can be pointed at.
+#
+# The numbers below are fitted to `run` rather than to the model, which is the
+# difference between what the model costs and what a conversion costs: `run`
+# blends every finished frame back towards a plain enlargement of its source,
+# and holds fp32 copies of both while it does.  Measured at the entry point the
+# plan is actually sizing:
+#
+#     source       chunk 6   chunk 16
+#     720x1280      3.25 GB   4.17 GB
+#     1080x1920     3.76 GB   4.92 GB
+#     1280x2276     4.19 GB   5.49 GB
+#
+# Every constant here is rounded up from its fit, so all six come out predicted
+# a little high.  Guessing high costs a few frames of chunk; guessing low costs
+# the conversion.
+FIXED_BYTES = 2.4e9
+# The single-frame working set, per source pixel: the propagation features, the
+# residual stacks' own temporaries, and the assembled four-times frame the head
+# writes its bands into.  Paid once however long the chunk is, because only one
+# frame is ever in the head at a time.
+#
+# The old number here was also 400 -- it was never the magnitude that was wrong,
+# it was that this was multiplied by the chunk length.  Fitted at 351.
+WORKING_BYTES_PER_PIXEL = 400
+# And per source pixel per frame of the chunk, which is all that genuinely
+# scales with chunk length now: the caller's copy of the frames and the model's
+# cleaned clone of them, 6 bytes each, and both flow fields at 8.  Measured at
+# 20.1, 20.1 and 20.3 bytes at the three sizes above, which is the arithmetic
+# exactly.
+CHUNK_BYTES_PER_PIXEL = 20
+# And per pixel of the *finished* frame per frame of the chunk.  Six of it is the
+# frames themselves, three channels of fp16 held until the chunk is handed back.
+# The rest is what `run` does with each one on the way out -- `torch.lerp`
+# between the model's picture and a bicubic enlargement of the source, both in
+# fp32 -- which is a per-frame transient rather than a per-chunk cost, but sits
+# here because it is what the allocator has to have room for while the finished
+# frames are still resident.  Fitted at 9.5 across the three sizes.
+FINISHED_BYTES_PER_PIXEL = 10
+# However much room there seems to be.
+#
+# This used to stand for memory -- a longer chunk was held to cost a great deal
+# of it -- and that is no longer why it is here.  A frame of chunk costs about
+# 88 MB at 1080x1920 now, so the card would carry a hundred of them.  What the
+# ceiling stands for is time: the window advances by `chunk - 2 * overlap`, a
+# chunk is computed before any of it comes back, and the pass counts frames
+# going in so that a Stop button has something to act on.  Sixteen is a few
+# seconds of work at a time, which is a reasonable thing to ask someone to wait
+# for and a reasonable thing to throw away when they stop.
+#
+# It could rise, and there is a case for it: eighteen would put `BEST_OVERLAP`
+# at the full six frames rather than five.  That is a change to how every clip
+# is converted rather than to whether it converts at all, so it is left alone
+# here and noted as available.
 MAX_CHUNK = 16
-# The overlap gives way before the card does.  Six frames each end wants a chunk
-# of thirteen, which at 1080x1920 is 17.9 GB -- past a 16 GB card before a single
-# frame is upscaled.  Shortening it costs temporal context at the joins, which is
-# a visible seam; not shortening it costs the conversion.
+# The overlap gives way before the card does.  Shortening it costs temporal
+# context at the joins, which is a visible seam; not shortening it costs the
+# conversion, a chunk having to be longer than what it discards.
+#
+# It reaches this floor much less often than it did.  The case that used to be
+# quoted here -- six frames each end wanting a chunk of thirteen, which at
+# 1080x1920 was 17.9 GB and past a 16 GB card before a single frame was
+# upscaled -- costs 3.8 GB now, and is not the constraint on anything.
 MIN_OVERLAP = 1
 # And it gives way again to arithmetic.  The window advances by
 # `chunk - 2 * overlap`, so six frames of overlap on a chunk of fourteen advances
@@ -421,8 +597,8 @@ MIN_OVERLAP = 1
 # half minutes for a two-second clip.  Holding the overlap to a third of the
 # chunk keeps the advance at a third of it, so nothing is computed more than
 # three times.  A quarter here would be cheaper -- 1.7 passes a frame rather
-# than 3 -- but on a 16 GB card it caps the overlap at three frames whatever the
-# clip, and the joins are what the whole chunked arrangement is trying to hide.
+# than 3 -- but it caps the overlap at four frames whatever the clip, and the
+# joins are what the whole chunked arrangement is trying to hide.
 OVERLAP_SHARE = 3
 # Below this many frames at a time there is no point running this model at all.
 # Propagating along the sequence is the whole reason for choosing it over a
@@ -459,9 +635,13 @@ def chunk_plan(free_bytes, width, height, out_width=None, overlap=OVERLAP):
     it is a visible seam, and a quiet one is worse than a mentioned one.
     """
     scale = (out_width / (width * SCALE)) if out_width else 1.0
-    finished = 3 * (width * SCALE * scale) * (height * SCALE * scale) * 2  # fp16
-    per_frame = finished + BYTES_PER_SOURCE_PIXEL * width * height
-    room = max(0.0, free_bytes * 0.8 - FIXED_BYTES)
+    finished = ((width * SCALE * scale) * (height * SCALE * scale)
+                * FINISHED_BYTES_PER_PIXEL)
+    per_frame = finished + CHUNK_BYTES_PER_PIXEL * width * height
+    # The frame's own working set comes off the top rather than being charged
+    # per frame of the chunk, which is what it actually is -- see `FIXED_BYTES`.
+    room = max(0.0, free_bytes * 0.8 - FIXED_BYTES
+               - WORKING_BYTES_PER_PIXEL * width * height)
     fits = int(room // max(per_frame, 1))
     if fits < MIN_USEFUL_CHUNK:
         return 0, 0  # not enough room to be worth doing; the caller says so
